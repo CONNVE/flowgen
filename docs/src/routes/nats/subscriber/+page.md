@@ -50,6 +50,7 @@ Consumes messages from a NATS JetStream stream. Source task — typically first 
 | `max_bytes` | int | | Max stream size in bytes. |
 | `retention` | string | `limits` | Retention policy: `limits`, `interest`, `work_queue`. |
 | `discard` | string | `old` | Discard policy: `old`, `new`. |
+| `discard_new_per_subject` | bool | false | When `true`, rejects new messages if `max_messages_per_subject` limit is reached for that subject. Requires `discard: new`. |
 | `duplicate_window` | duration | | Deduplication window. |
 
 ## Output

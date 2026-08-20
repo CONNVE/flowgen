@@ -118,6 +118,12 @@ impl EventHandler {
                 .to_publish()
                 .map_err(|source| Error::MessageConversion { source })?;
 
+            let e = if let Some(msg_id) = &config.msg_id {
+                e.message_id(msg_id.clone())
+            } else {
+                e
+            };
+
             let ack_future = self
                 .jetstream
                 .lock()

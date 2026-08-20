@@ -19,7 +19,7 @@ exclude = [".cargo"]
 allow_attributes = "deny"
 
 [workspace.package]
-version = "0.134.0"
+version = "0.135.0"
 authors = ["CONNVE"]
 license = "MPL-2.0"
 edition = "2021"
@@ -33,11 +33,10 @@ gcloud-auth = { git = "https://github.com/connve/google-cloud-rust" }
 gcloud-gax = { git = "https://github.com/connve/google-cloud-rust" }
 gcloud-googleapis = { git = "https://github.com/connve/google-cloud-rust" }
 google-cloud-gax = { version = "0.21" }
-object_store = { version = "0.13.1", default-features = false, features = [
+object_store = { version = "0.14", default-features = false, features = [
     "aws",
     "gcp",
     "fs",
-    "tls-webpki-roots",
 ] }
 bytes = { version = "1.11.1" }
 handlebars = { version = "6.3" }

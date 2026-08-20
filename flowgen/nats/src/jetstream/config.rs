@@ -119,6 +119,13 @@ pub struct Config {
     /// When not set, the task receives from the previous task in the list (linear chain).
     #[serde(default)]
     pub depends_on: Option<Vec<String>>,
+    /// Optional NATS message ID for server-side deduplication.
+    /// Can be a static string or templated from event data (e.g.
+    /// `"{{event.data.record_id}}"`, `"fixed-key"`).
+    /// When set, overrides `event.id` as the `Nats-Msg-Id` header on publish.
+    /// Requires `duplicate_window` on the stream to take effect.
+    #[serde(default)]
+    pub msg_id: Option<String>,
     /// Optional retry configuration (overrides app-level retry config).
     #[serde(default)]
     pub retry: Option<flowgen_core::retry::RetryConfig>,
@@ -163,6 +170,10 @@ pub struct StreamOptions {
     /// Discard policy for when stream limits are reached.
     /// If None during update, keeps the existing value.
     pub discard: Option<DiscardPolicy>,
+    /// When `true`, prevents a message from being added to the stream
+    /// if the `max_messages_per_subject` limit for the subject has been reached.
+    /// Requires `discard: New` to be set.
+    pub discard_new_per_subject: Option<bool>,
     /// Duplicate window (e.g., "120s", "2m", "1h").
     /// Prevents duplicate messages within this time window.
     #[serde(default, with = "humantime_serde")]

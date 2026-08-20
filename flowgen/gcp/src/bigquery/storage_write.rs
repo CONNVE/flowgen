@@ -492,10 +492,13 @@ impl EventHandler {
             };
 
             // Create append request with proper proto descriptor.
-            let builder = AppendRowsRequestBuilder::new(
+            let mut builder = AppendRowsRequestBuilder::new(
                 self.proto_descriptor.clone(),
                 proto_rows,
             );
+            if let Some(trace_id) = config.trace_id.clone() {
+                builder = builder.with_trace_id(trace_id);
+            }
 
             // Append rows to the reusable default write stream.
             let mut responses = self

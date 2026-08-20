@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.135.0
+
+### Features
+
+- **NATS JetStream publisher can now set a custom `Nats-Msg-Id` for
+  server-side deduplication.** The new `msg_id` field accepts a
+  templated string (e.g. `{{event.data.id}}`), overriding the previous
+  hardcoded fallback to `event.id`. Combined with a stream's
+  `duplicate_window`, republishing the same logical record no longer
+  stores a second copy — the server acks it as a duplicate instead of
+  erroring.
+- **JetStream streams can now hard-reject duplicate messages on a
+  subject.** The new `discard_new_per_subject` option, used together
+  with `discard: new` and `max_messages_per_subject`, makes the server
+  refuse a second publish to a subject that's already at its cap,
+  rather than silently evicting the first message to make room.
+
+### Fixes
+
+- **`bigquery_storage_write`'s `trace_id` field was accepted in config
+  but never sent anywhere.** It's now passed through to the BigQuery
+  Storage Write API's `AppendRowsRequest`, so request tracing actually
+  works as documented.
+
 ## 0.134.0
 
 ### Features
