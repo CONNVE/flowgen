@@ -317,6 +317,190 @@ async fn read_emits_every_matching_document() {
 
 #[tokio::test]
 #[ignore = "requires Docker daemon; run in CI via `cargo test -- --ignored`"]
+async fn upsert_updates_matching_or_inserts_new_document() {
+    let (_mongo, credentials_path) = start_mongo().await;
+
+    let (write_tx, mut write_rx) = spawn_collection_processor(Collection {
+        name: "write_customer".to_string(),
+        operation: Operation::Write,
+        credentials_path: Some(credentials_path.clone()),
+        db_name: "sales".to_string(),
+        collection_name: "customers".to_string(),
+        filter: Default::default(),
+        depends_on: None,
+        retry: None,
+    })
+    .await;
+    write_tx
+        .send(drive_event(serde_json::json!({
+            "name": "Ada",
+            "email": "ada@example.com"
+        })))
+        .await
+        .expect("send write event");
+    let written = tokio::time::timeout(Duration::from_secs(10), write_rx.recv())
+        .await
+        .expect("write emits result")
+        .expect("channel open")
+        .data_as_json()
+        .expect("json");
+    let original_id = written.get("insertedId").cloned();
+
+    let (upsert_tx, mut upsert_rx) = spawn_collection_processor(Collection {
+        name: "upsert_customers".to_string(),
+        operation: Operation::Upsert,
+        credentials_path: Some(credentials_path.clone()),
+        db_name: "sales".to_string(),
+        collection_name: "customers".to_string(),
+        filter: std::collections::HashMap::from([(
+            "email".to_string(),
+            "ada@example.com".to_string(),
+        )]),
+        depends_on: None,
+        retry: None,
+    })
+    .await;
+
+    // A match: the plain document is wrapped in `$set`, applied, and the
+    // updated document is emitted. `_id` is only set on insert, so the
+    // matched document's `_id` is left untouched.
+    upsert_tx
+        .send(drive_event(serde_json::json!({
+            "_id": "696a1d842f9c12344cd86eab",
+            "id": "2-updated",
+            "name": "Sayan updated",
+            "status": "active"
+        })))
+        .await
+        .expect("send upsert event");
+    let updated = tokio::time::timeout(Duration::from_secs(10), upsert_rx.recv())
+        .await
+        .expect("upsert emits result")
+        .expect("channel open")
+        .data_as_json()
+        .expect("json");
+    assert_eq!(
+        updated.get("name").and_then(|v| v.as_str()),
+        Some("Sayan updated"),
+        "matched upsert must emit the updated document, got {updated:?}"
+    );
+    assert_eq!(
+        updated.get("status").and_then(|v| v.as_str()),
+        Some("active")
+    );
+    assert_eq!(
+        updated.get("_id"),
+        original_id.as_ref(),
+        "matched upsert must not modify _id; updated={updated:?} original={original_id:?}"
+    );
+
+    // No match: a plain document for a filter with no existing document
+    // triggers the upsert insert path, which sets the payload `_id` via
+    // `$setOnInsert`.
+    let (upsert_insert_tx, mut upsert_insert_rx) = spawn_collection_processor(Collection {
+        name: "upsert_new_customers".to_string(),
+        operation: Operation::Upsert,
+        credentials_path: Some(credentials_path.clone()),
+        db_name: "sales".to_string(),
+        collection_name: "customers".to_string(),
+        filter: std::collections::HashMap::from([(
+            "email".to_string(),
+            "grace@example.com".to_string(),
+        )]),
+        depends_on: None,
+        retry: None,
+    })
+    .await;
+    upsert_insert_tx
+        .send(drive_event(serde_json::json!({
+            "_id": "66803022a16e6a0000edb3f9",
+            "id": "2-updated",
+            "name": "Grace",
+            "email": "grace@example.com",
+            "status": "inactive"
+        })))
+        .await
+        .expect("send upsert event");
+    let inserted = tokio::time::timeout(Duration::from_secs(10), upsert_insert_rx.recv())
+        .await
+        .expect("upsert emits result")
+        .expect("channel open")
+        .data_as_json()
+        .expect("json");
+    assert_eq!(
+        inserted.get("email").and_then(|v| v.as_str()),
+        Some("grace@example.com"),
+        "non-matching upsert must insert and emit the new document, got {inserted:?}"
+    );
+    assert_eq!(
+        inserted.get("status").and_then(|v| v.as_str()),
+        Some("inactive")
+    );
+    assert_eq!(
+        inserted.get("_id"),
+        Some(&serde_json::json!("66803022a16e6a0000edb3f9")),
+        "inserted document must get the payload _id"
+    );
+
+    // Documents whose keys are all update operators are applied verbatim.
+    upsert_insert_tx
+        .send(drive_event(serde_json::json!({
+            "$inc": { "visits": 1 }
+        })))
+        .await
+        .expect("send upsert event");
+    let visit_doc = tokio::time::timeout(Duration::from_secs(10), upsert_insert_rx.recv())
+        .await
+        .expect("upsert emits result")
+        .expect("channel open")
+        .data_as_json()
+        .expect("json");
+    assert_eq!(
+        visit_doc.get("visits").and_then(|v| v.as_i64()),
+        Some(1),
+        "update-operator payload must be applied verbatim, got {visit_doc:?}"
+    );
+
+    // Both documents are now present; the match was not duplicated.
+    let (read_tx, mut read_rx) = spawn_collection_processor(Collection {
+        name: "read_customers".to_string(),
+        operation: Operation::Read,
+        credentials_path: Some(credentials_path),
+        db_name: "sales".to_string(),
+        collection_name: "customers".to_string(),
+        filter: Default::default(),
+        depends_on: None,
+        retry: None,
+    })
+    .await;
+    read_tx
+        .send(drive_event(serde_json::json!({})))
+        .await
+        .expect("send read event");
+
+    let mut names = Vec::new();
+    for _ in 0..2 {
+        let event = tokio::time::timeout(Duration::from_secs(10), read_rx.recv())
+            .await
+            .expect("read emits result")
+            .expect("channel open");
+        let name = event
+            .data_as_json()
+            .expect("json")
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        names.push(name);
+    }
+    names.sort();
+    assert_eq!(
+        names,
+        vec![Some("Grace".to_string()), Some("Sayan updated".to_string())]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker daemon; run in CI via `cargo test -- --ignored`"]
 async fn change_stream_emits_event_on_insert() {
     let (_mongo, credentials_path) = start_mongo().await;
 

@@ -246,7 +246,7 @@ async fn dispatch_chat_completions(
 
     let ctx = match resolve_registration(&state, Protocol::Openai, proxy_name, &headers).await {
         Ok(c) => c,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     if let Some(resp) = require_model_choice(&ctx.registration, &downstream_model) {
@@ -334,7 +334,7 @@ async fn dispatch_messages(
 
     let ctx = match resolve_registration(&state, Protocol::Anthropic, proxy_name, &headers).await {
         Ok(c) => c,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     if let Some(resp) = require_model_choice(&ctx.registration, &downstream_model) {
@@ -396,10 +396,14 @@ async fn resolve_registration(
     expected_protocol: Protocol,
     proxy_name: String,
     headers: &HeaderMap,
-) -> Result<DispatchContext, Response> {
+) -> Result<DispatchContext, Box<Response>> {
     let registration = match state.table.get(&proxy_name) {
         Some(entry) => entry.clone(),
-        None => return Err(DispatchError::UnknownProxy { name: proxy_name }.into_response()),
+        None => {
+            return Err(Box::new(
+                DispatchError::UnknownProxy { name: proxy_name }.into_response(),
+            ));
+        }
     };
 
     if !headers_satisfy(headers, &registration.config.headers) {
@@ -409,24 +413,28 @@ async fn resolve_registration(
             registration.task_id,
             registration.task_type,
         );
-        return Err(DispatchError::ProxyNotVisible { name: proxy_name }.into_response());
+        return Err(Box::new(
+            DispatchError::ProxyNotVisible { name: proxy_name }.into_response(),
+        ));
     }
 
     if registration.protocol != expected_protocol {
-        return Err(DispatchError::WrongProtocolForUrl { name: proxy_name }.into_response());
+        return Err(Box::new(
+            DispatchError::WrongProtocolForUrl { name: proxy_name }.into_response(),
+        ));
     }
 
     if registration.cancellation_token.is_cancelled() {
-        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        return Err(Box::new(StatusCode::SERVICE_UNAVAILABLE.into_response()));
     }
 
     if let Err(e) = validate_endpoint_auth(registration.credentials.as_ref(), headers) {
-        return Err(e.into_response());
+        return Err(Box::new(e.into_response()));
     }
 
     let user_context = match validate_user_auth(&registration, headers).await {
         Ok(ctx) => ctx,
-        Err(e) => return Err(e.into_response()),
+        Err(e) => return Err(Box::new(e.into_response())),
     };
 
     Ok(DispatchContext {

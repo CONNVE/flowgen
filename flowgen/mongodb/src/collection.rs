@@ -4,6 +4,7 @@ use flowgen_core::config::ConfigExt;
 use flowgen_core::event::{Event, EventData, EventExt};
 use futures::TryStreamExt;
 use mongodb::bson::{oid::ObjectId, Bson, Document as BsonDocument};
+use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 use mongodb::Collection;
 use serde_json::Value;
 use std::sync::Arc;
@@ -95,6 +96,7 @@ impl EventHandler {
         match self.config.operation {
             Operation::Read => self.read(event).await,
             Operation::Write => self.write(event).await,
+            Operation::Upsert => self.upsert(event).await,
         }
     }
 
@@ -254,10 +256,119 @@ impl EventHandler {
 
         Ok(())
     }
+
+    /// Upserts the first document matching `filter`: applies the update
+    /// operators from the incoming event's JSON payload to the match, or
+    /// inserts an aggregated document if nothing matches.
+    async fn upsert(&self, event: Event) -> Result<(), Error> {
+        let event = Arc::new(event);
+        let completion_tx_arc = Arc::clone(&event).completion_tx.clone();
+
+        let json = match &event.data {
+            EventData::Json(value) => value.clone(),
+            _ => return Err(Error::UnsupportedEventData),
+        };
+
+        // The incoming payload is either a document whose keys are all update
+        // operators (e.g. `$set`, `$inc`), applied verbatim, or a plain
+        // document that is wrapped in `$set`. Any `_id` in a plain document is
+        // moved to `$setOnInsert` so it is only set when a new document is
+        // inserted, never on an existing match.
+        let payload_doc = match Bson::try_from(json).map_err(|source| Error::Bson { source })? {
+            Bson::Document(d) => d,
+            _ => return Err(Error::InvalidDocument),
+        };
+
+        let update_doc = if payload_doc.keys().all(|key| key.starts_with('$')) {
+            payload_doc
+        } else {
+            let mut set = BsonDocument::new();
+            let mut set_on_insert = BsonDocument::new();
+            for (key, value) in payload_doc {
+                if key == "_id" {
+                    set_on_insert.insert(key, value);
+                } else {
+                    set.insert(key, value);
+                }
+            }
+            let mut update = BsonDocument::new();
+            update.insert("$set", set);
+            if !set_on_insert.is_empty() {
+                update.insert("$setOnInsert", set_on_insert);
+            }
+            update
+        };
+
+        let collection: Collection<BsonDocument> = self
+            .client
+            .database(&self.config.db_name)
+            .collection(&self.config.collection_name);
+
+        let filter = build_filter_doc(&self.config.filter);
+
+        let options = FindOneAndUpdateOptions::builder()
+            .upsert(true)
+            .return_document(ReturnDocument::After)
+            .build();
+
+        let doc = collection
+            .find_one_and_update(filter, update_doc)
+            .with_options(options)
+            .await
+            .map_err(|source| Error::MongoDB { source })?;
+
+        match doc {
+            Some(document) => {
+                let mut e = document
+                    .to_event(self.task_type, self.task_id)
+                    .map_err(|source| Error::MessageConversion { source })?;
+
+                match self.tx {
+                    None => {
+                        if let Some(arc) = completion_tx_arc.as_ref() {
+                            arc.signal_completion(e.data_as_json().ok());
+                        }
+                    }
+                    Some(_) => {
+                        e.completion_tx = completion_tx_arc.clone();
+                    }
+                }
+
+                e.send_with_logging(self.tx.as_ref())
+                    .await
+                    .map_err(|source| Error::SendMessage { source })?;
+            }
+            None => {
+                let mut e = flowgen_core::event::EventBuilder::new()
+                    .data(EventData::Json(serde_json::json!({ "matched": 0 })))
+                    .task_id(self.task_id)
+                    .task_type(self.task_type)
+                    .build()
+                    .map_err(|source| Error::EventBuilder { source })?;
+
+                match self.tx {
+                    None => {
+                        if let Some(arc) = completion_tx_arc.as_ref() {
+                            arc.signal_completion(e.data_as_json().ok());
+                        }
+                    }
+                    Some(_) => {
+                        e.completion_tx = completion_tx_arc.clone();
+                    }
+                }
+
+                e.send_with_logging(self.tx.as_ref())
+                    .await
+                    .map_err(|source| Error::SendMessage { source })?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
-/// MongoDB collection processor: reads or writes documents depending on
-/// `config.operation`.
+/// MongoDB collection processor: reads, writes, or upserts documents
+/// depending on `config.operation`.
 #[derive(Debug)]
 pub struct Processor {
     config: Arc<super::config::Collection>,
@@ -639,6 +750,35 @@ mod tests {
 
         let result = handler.handle(event).await;
         assert!(matches!(result, Err(Error::InvalidObjectId { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_upsert_rejects_unsupported_event_data() {
+        let client = Arc::new(
+            mongodb::Client::with_uri_str("mongodb://localhost:27017")
+                .await
+                .unwrap(),
+        );
+        let handler = EventHandler {
+            client,
+            config: Arc::new(mock_config(Operation::Upsert)),
+            task_id: 1,
+            tx: None,
+            task_type: "test",
+        };
+
+        let schema = Arc::new(arrow::datatypes::Schema::empty());
+        let batch = arrow::record_batch::RecordBatch::new_empty(schema);
+        let event = flowgen_core::event::EventBuilder::new()
+            .data(EventData::ArrowRecordBatch(batch))
+            .subject("test".to_string())
+            .task_id(1)
+            .task_type("test")
+            .build()
+            .unwrap();
+
+        let result = handler.handle(event).await;
+        assert!(matches!(result, Err(Error::UnsupportedEventData)));
     }
 
     #[test]

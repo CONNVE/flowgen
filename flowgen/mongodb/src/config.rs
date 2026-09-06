@@ -4,7 +4,7 @@
 //! with MongoDB in two distinct modes:
 //!
 //! 1. **Collection (`Collection`):** CRUD-style operations against a collection
-//!    (`read`, `write`, and future operations like `upsert`/`delete`).
+//!    (`read`, `write`, `upsert`, and future operations like `delete`).
 //! 2. **Change Stream (`ChangeStream`):** Configuration for Change Data Capture (CDC)
 //!    to listen for real-time changes.
 
@@ -21,6 +21,12 @@ pub enum Operation {
     Read,
     /// Insert the incoming event's JSON payload as a document.
     Write,
+    /// Update the first document matching `filter` with the incoming event's
+    /// JSON payload: a plain payload is wrapped in `$set` (its `_id`, if any,
+    /// is only set on insert), or applied verbatim when every top-level key is
+    /// an update operator (e.g. `$set`, `$inc`). Inserts an aggregated
+    /// document if nothing matches (`find_one_and_update` with `upsert: true`).
+    Upsert,
 }
 
 /// MongoDB collection task configuration: read or write documents.
@@ -39,7 +45,8 @@ pub struct Collection {
     pub db_name: String,
     /// The Collection Name from MongoDB.
     pub collection_name: String,
-    /// Key-value pairs to filter documents. Only used by `operation: read`.
+    /// Key-value pairs to filter documents. Used by `operation: read` and
+    /// `operation: upsert`.
     #[serde(default)]
     pub filter: HashMap<String, String>,
     #[serde(default)]
@@ -101,6 +108,16 @@ mod tests {
     #[test]
     fn test_collection_write_serde_roundtrip() {
         let c = fixture(Operation::Write);
+        let s = serde_json::to_string(&c).unwrap();
+        let de: Collection = serde_json::from_str(&s).unwrap();
+        assert_eq!(c, de);
+    }
+
+    #[test]
+    fn test_collection_upsert_serde_roundtrip() {
+        let mut c = fixture(Operation::Upsert);
+        c.filter.insert("status".to_string(), "active".to_string());
+
         let s = serde_json::to_string(&c).unwrap();
         let de: Collection = serde_json::from_str(&s).unwrap();
         assert_eq!(c, de);

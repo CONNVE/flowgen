@@ -1,8 +1,8 @@
 # MongoDB
 
-Flowgen reads and writes MongoDB documents, and watches change streams for real-time updates.
+Flowgen reads, writes, and upserts MongoDB documents, and watches change streams for real-time updates.
 
-- [Collection](/docs/flowgen/mongodb/collection) — reads or writes documents in a collection.
+- [Collection](/docs/flowgen/mongodb/collection) — reads, writes, or upserts documents in a collection.
 - [Change Stream](/docs/flowgen/mongodb/change_stream) — watches a database for real-time document changes.
 
 ## Credentials
