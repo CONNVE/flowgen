@@ -21,7 +21,14 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::mpsc;
 
+/// Serialises container startup across the tests in this file. Four of them
+/// call `start_mongo` at once, and concurrent starts of the same image race
+/// in the Docker daemon — surfacing as `PullImage("bytes remaining on
+/// stream")` or a truncated boot log that never matches `WaitFor`.
+static START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn start_mongo() -> (ContainerAsync<GenericImage>, std::path::PathBuf) {
+    let guard = START_LOCK.lock().await;
     let container = GenericImage::new("mongo", "7.0")
         .with_exposed_port(27017.tcp())
         .with_wait_for(WaitFor::message_on_stdout("Waiting for connections"))
@@ -29,6 +36,7 @@ async fn start_mongo() -> (ContainerAsync<GenericImage>, std::path::PathBuf) {
         .start()
         .await
         .expect("start mongo container");
+    drop(guard);
     let port = container
         .get_host_port_ipv4(27017)
         .await
