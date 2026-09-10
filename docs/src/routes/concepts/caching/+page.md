@@ -19,7 +19,10 @@ cache:
   type: nats
   credentials_path: /etc/nats/credentials.json
   url: "{{env.NATS_URL}}"
-  db_name: flowgen_cache
+  runtime:
+    db_name: flowgen_cache
+  system:
+    db_name: flowgen_system
   history: 64
   tombstone_ttl: "1h"
 ```
@@ -30,9 +33,12 @@ cache:
 | `type` | string | required | Cache backend: `nats`. |
 | `credentials_path` | string | optional | Path to NATS credentials. |
 | `url` | string | `localhost:4222` | NATS server URL. |
-| `db_name` | string | `flowgen_cache` | KV bucket name. |
+| `runtime.db_name` | string | `flowgen_cache` | KV bucket for flow state — the one `ctx.cache` reads and writes. |
+| `system.db_name` | string | `flowgen_system` | KV bucket for leader-election leases and peer registration. Created whenever the cache is enabled. |
 | `history` | int | 64 | Historical entries retained per key. Server caps at 64. |
 | `tombstone_ttl` | duration | `1h` | TTL for delete markers. Enables per-key TTL on entries. |
+
+Coordination state lives in its own bucket so a flow's script cannot read or overwrite another pod's lease. `ctx.cache` only ever reaches the runtime bucket.
 
 ## Operations
 

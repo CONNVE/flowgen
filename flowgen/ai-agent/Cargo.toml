@@ -34,9 +34,9 @@ humantime-serde = { workspace = true }
 base64 = { workspace = true }
 tokio-util = { workspace = true }
 http = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
-reqwest = { workspace = true }
 bytes = { workspace = true }
 
 [lints]

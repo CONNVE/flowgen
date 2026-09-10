@@ -52,6 +52,7 @@ fn spawn_renewal_task(
     lease_name: String,
     executor: Arc<crate::executor::Executor>,
     current_revision: Arc<Mutex<u64>>,
+    generation: u64,
     response_tx: mpsc::UnboundedSender<LeaderElectionResult>,
     active_leases: Arc<Mutex<HashMap<String, ActiveLease>>>,
 ) -> JoinHandle<()> {
@@ -64,7 +65,10 @@ fn spawn_renewal_task(
 
                 let revision = *current_revision.lock().await;
 
-                match executor.renew_lease(&lease_name, revision).await {
+                match executor
+                    .renew_lease(&lease_name, revision, generation)
+                    .await
+                {
                     Ok(crate::executor::RenewalResult::Renewed {
                         revision: new_revision,
                     }) => {
@@ -161,14 +165,24 @@ fn spawn_acquisition_retry_task(
                 initial_backoff: executor.config.retry_config.initial_backoff,
             };
             let mut retry_strategy = infinite_retry_config.strategy();
+            // A held lease is the expected state for a standby, not a failure,
+            // so backoff is capped: an uncapped one keeps doubling until the
+            // pod checks once a day and can no longer take over.
+            let max_backoff = executor.config.renewal_interval;
             let mut attempt = 0;
 
             loop {
                 attempt += 1;
 
                 match executor.acquire_lease(&lease_name).await {
-                    Ok(crate::executor::LeaseResult::Acquired { revision })
-                    | Ok(crate::executor::LeaseResult::TakenOver { revision }) => {
+                    Ok(crate::executor::LeaseResult::Acquired {
+                        revision,
+                        generation,
+                    })
+                    | Ok(crate::executor::LeaseResult::TakenOver {
+                        revision,
+                        generation,
+                    }) => {
                         *current_revision.lock().await = revision;
 
                         debug!(
@@ -189,6 +203,7 @@ fn spawn_acquisition_retry_task(
                             lease_name.clone(),
                             executor.clone(),
                             current_revision.clone(),
+                            generation,
                             response_tx.clone(),
                             active_leases.clone(),
                         );
@@ -207,6 +222,12 @@ fn spawn_acquisition_retry_task(
                             attempt = %attempt,
                             "Lease held by other, will retry"
                         );
+                        // Healthy standby: poll flat so takeover lands within
+                        // one lease cycle, and drop any backoff a prior error
+                        // built up.
+                        retry_strategy = infinite_retry_config.strategy();
+                        tokio::time::sleep(max_backoff).await;
+                        continue;
                     }
                     Err(e) => {
                         warn!(
@@ -217,7 +238,7 @@ fn spawn_acquisition_retry_task(
                     }
                 }
 
-                if let Some(delay) = retry_strategy.next() {
+                if let Some(delay) = retry_strategy.next().map(|d| d.min(max_backoff)) {
                     debug!(
                         task_id = %task_id,
                         delay_ms = %delay.as_millis(),
@@ -344,8 +365,14 @@ impl TaskManager {
                         }
 
                         match executor.acquire_lease(&lease_name).await {
-                            Ok(crate::executor::LeaseResult::Acquired { revision })
-                            | Ok(crate::executor::LeaseResult::TakenOver { revision }) => {
+                            Ok(crate::executor::LeaseResult::Acquired {
+                                revision,
+                                generation,
+                            })
+                            | Ok(crate::executor::LeaseResult::TakenOver {
+                                revision,
+                                generation,
+                            }) => {
                                 // Successfully acquired the lease.
                                 let current_revision = Arc::new(Mutex::new(revision));
                                 let renewal_handle = spawn_renewal_task(
@@ -353,6 +380,7 @@ impl TaskManager {
                                     lease_name.clone(),
                                     executor.clone(),
                                     current_revision,
+                                    generation,
                                     registration.response_tx.clone(),
                                     active_leases.clone(),
                                 );
@@ -613,8 +641,11 @@ mod tests {
 
         // Pod 2 owns the lease — we want pod 1's renewal to lose immediately.
         let res = exec2.acquire_lease("acct_nba").await.unwrap();
-        let pod2_revision = match res {
-            crate::executor::LeaseResult::Acquired { revision } => revision,
+        let (pod2_revision, pod2_generation) = match res {
+            crate::executor::LeaseResult::Acquired {
+                revision,
+                generation,
+            } => (revision, generation),
             other => panic!("pod-2 should acquire fresh, got {other:?}"),
         };
 
@@ -629,6 +660,7 @@ mod tests {
             "acct_nba".to_string(),
             exec1.clone(),
             stale_revision,
+            pod2_generation,
             response_tx,
             active_leases,
         );

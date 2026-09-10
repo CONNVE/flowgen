@@ -99,6 +99,10 @@ pub struct EventHandler {
     /// evict the exact entry that may be stale rather than recomputing it
     /// (and risking drift if `credentials_path` is templated).
     client_key: flowgen_core::client_registry::ClientKey,
+    /// Key for the shared gRPC channel. Evicted alongside `client_key` on
+    /// reconnect: the cached channel is the thing that just died, and
+    /// leaving it in place would hand every retry the same dead connection.
+    channel_key: flowgen_core::client_registry::ClientKey,
     /// Subscriber configuration
     config: Arc<super::config::Subscriber>,
     /// Channel sender for processed events
@@ -161,6 +165,10 @@ impl EventHandler {
         let last_replay_id = events.last().map(|ce| ce.replay_id.clone());
 
         for ce in events {
+            if self.task_context.cancellation_token.is_cancelled() {
+                break;
+            }
+
             if let Some(event) = ce.event {
                 let tx = self.tx.clone();
                 let task_id = self.task_id;
@@ -265,8 +273,7 @@ impl EventHandler {
             }
         }
 
-        // Only cache replay_id if all events in the batch succeeded.
-        if all_succeeded {
+        if all_succeeded && !self.task_context.cancellation_token.is_cancelled() {
             if let Some(replay_id) = last_replay_id {
                 if self
                     .config
@@ -370,6 +377,7 @@ impl EventHandler {
             // Process managed subscription events.
             while let Some(event) = stream.next().await {
                 if self.task_context.cancellation_token.is_cancelled() {
+                    drop(stream);
                     return Ok(());
                 }
 
@@ -384,6 +392,11 @@ impl EventHandler {
 
                 self.process_events(events, &schema_info, topic_name)
                     .await?;
+
+                if self.task_context.cancellation_token.is_cancelled() {
+                    drop(stream);
+                    return Ok(());
+                }
             }
 
             return Err(Error::StreamEnded);
@@ -491,6 +504,7 @@ impl EventHandler {
 
         while let Some(event) = stream.next().await {
             if self.task_context.cancellation_token.is_cancelled() {
+                drop(stream);
                 return Ok(());
             }
 
@@ -505,6 +519,11 @@ impl EventHandler {
 
             self.process_events(events, &schema_info, topic_name)
                 .await?;
+
+            if self.task_context.cancellation_token.is_cancelled() {
+                drop(stream);
+                return Ok(());
+            }
         }
 
         Err(Error::StreamEnded)
@@ -556,18 +575,36 @@ impl flowgen_core::task::runner::Runner for Subscriber {
             ),
         };
 
-        // Create gRPC service connection.
-        let service = flowgen_core::service::ServiceBuilder::new()
-            .endpoint(endpoint)
-            .build()
-            .map_err(|e| Error::Service { source: e })?
-            .connect()
+        // One gRPC channel per endpoint, shared through the client registry.
+        // `Channel` is a cheap handle over a connection pool, so clones
+        // multiplex onto the same HTTP/2 connection instead of each
+        // subscription opening its own — several subscriptions against one
+        // org otherwise hold several TLS connections open, each running its
+        // own keepalive whether or not events are flowing.
+        let channel_key = flowgen_core::client_registry::ClientKeyBuilder::new("salesforce_pubsub")
+            .field("grpc_endpoint", &endpoint)
+            .build();
+        let channel = self
+            .task_context
+            .client_registry
+            .get_or_init(channel_key.clone(), || async {
+                let service = flowgen_core::service::ServiceBuilder::new()
+                    .endpoint(endpoint)
+                    .build()
+                    .map_err(|e| Error::Service { source: e })?
+                    .connect()
+                    .await
+                    .map_err(|e| Error::Service { source: e })?;
+                service.channel.ok_or_else(|| Error::Service {
+                    source: flowgen_core::service::Error::MissingEndpoint(),
+                })
+            })
             .await
-            .map_err(|e| Error::Service { source: e })?;
-
-        let channel = service.channel.ok_or_else(|| Error::Service {
-            source: flowgen_core::service::Error::MissingEndpoint(),
-        })?;
+            .map_err(|e| match e {
+                flowgen_core::client_registry::Error::Init { source } => source,
+                flowgen_core::client_registry::Error::TypeMismatch => Error::ClientRegistryMismatch,
+            })?;
+        let channel = (*channel).clone();
 
         // Authenticate with Salesforce (shared via client registry).
         let credentials_path = init_config.credentials_path.clone();
@@ -603,6 +640,7 @@ impl flowgen_core::task::runner::Runner for Subscriber {
         // Create event handler.
         Ok(EventHandler {
             client_key,
+            channel_key,
             config: Arc::clone(&self.config),
             task_id: self.task_id,
             tx: self.tx.clone(),
@@ -668,6 +706,7 @@ impl flowgen_core::task::runner::Runner for Subscriber {
 
             // Run event loop until failure, then reinitialize.
             let client_key = event_handler.client_key.clone();
+            let channel_key = event_handler.channel_key.clone();
             let handle_future = event_handler.handle();
             tokio::select! {
                 _ = cancellation_token.cancelled() => return Ok(()),
@@ -679,6 +718,7 @@ impl flowgen_core::task::runner::Runner for Subscriber {
             lost_connectivity = true;
 
             self.task_context.client_registry.remove(&client_key).await;
+            self.task_context.client_registry.remove(&channel_key).await;
 
             let delay = match reconnect_backoff.next() {
                 Some(d) => d,

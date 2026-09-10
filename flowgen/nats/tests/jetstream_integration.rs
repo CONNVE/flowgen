@@ -23,10 +23,19 @@ use tokio::sync::mpsc;
 /// Starts a NATS 2.11.8 container with JetStream enabled and returns
 /// its connection URL.
 async fn start_nats() -> (ContainerAsync<GenericImage>, String) {
+    let (container, url, _) = start_nats_monitored().await;
+    (container, url)
+}
+
+/// Same server, with the HTTP monitoring endpoint enabled. Returns the
+/// client URL and the `/varz` monitoring URL, which reports server-side
+/// counters no client-side assertion can reach.
+async fn start_nats_monitored() -> (ContainerAsync<GenericImage>, String, String) {
     let container = GenericImage::new("nats", "2.11.8-alpine")
         .with_exposed_port(4222.tcp())
+        .with_exposed_port(8222.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
-        .with_cmd(["-js"])
+        .with_cmd(["-js", "-m", "8222"])
         .start()
         .await
         .expect("start nats container");
@@ -34,7 +43,31 @@ async fn start_nats() -> (ContainerAsync<GenericImage>, String) {
         .get_host_port_ipv4(4222)
         .await
         .expect("map nats port");
-    (container, format!("nats://127.0.0.1:{port}"))
+    let monitor_port = container
+        .get_host_port_ipv4(8222)
+        .await
+        .expect("map nats monitoring port");
+    (
+        container,
+        format!("nats://127.0.0.1:{port}"),
+        format!("http://127.0.0.1:{monitor_port}/varz"),
+    )
+}
+
+/// Total messages the server has received, from `/varz`. Pull requests count
+/// here, so the delta over an idle window is how often the subscriber asked
+/// for work.
+async fn server_in_msgs(varz_url: &str) -> u64 {
+    let body = reqwest::get(varz_url)
+        .await
+        .expect("fetch varz")
+        .text()
+        .await
+        .expect("varz body");
+    let varz: serde_json::Value = serde_json::from_str(&body).expect("varz json");
+    varz.get("in_msgs")
+        .and_then(|v| v.as_u64())
+        .expect("varz in_msgs")
 }
 
 /// Builds a TaskContext with an in-memory cache — enough for the
@@ -171,7 +204,7 @@ async fn publisher_and_subscriber_round_trip_delivers_the_message() {
         subject: "rt.subject".to_string(),
         stream: Some(stream),
         durable_name: Some("rt_consumer".to_string()),
-        max_messages: Some(10),
+        max_messages_per_batch: 10,
         ack_timeout: Some(Duration::from_secs(5)),
         ..Default::default()
     });
@@ -449,4 +482,150 @@ async fn msg_id_template_different_keys_are_not_deduplicated() {
 
     drop(in_tx);
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+}
+
+/// An idle subscriber must wait on the server rather than poll it.
+///
+/// This is the regression behind the `fetch()` -> continuous-stream switch:
+/// `fetch()` returned immediately when the queue was empty, so an idle
+/// consumer re-requested in a tight loop and burned CPU and round-trips. The
+/// pull stream instead parks a batch request until it fills or
+/// `batch_expires` elapses.
+///
+/// The assertion is on request *volume*, taken from the server's own
+/// `in_msgs` counter, because that is what the bug actually was. A parked
+/// consumer re-requests only once per expiry; a spinning one issues hundreds
+/// over the same window, so the threshold sits far below the old behaviour
+/// and far above the new one.
+#[tokio::test]
+#[ignore = "requires Docker daemon; run in CI via `cargo test -- --ignored`"]
+async fn idle_subscriber_does_not_poll_the_server() {
+    let (_nats, url, varz) = start_nats_monitored().await;
+    let stream = stream_options("idle_stream", "idle.subject");
+
+    let idle_window = Duration::from_secs(5);
+    let batch_expires = Duration::from_secs(30);
+
+    let sub_config = Arc::new(JsConfig {
+        name: "subscriber".to_string(),
+        url: url.clone(),
+        subject: "idle.subject".to_string(),
+        stream: Some(stream),
+        durable_name: Some("idle_consumer".to_string()),
+        max_messages_per_batch: 10,
+        // Longer than the idle window, so a correct subscriber renews its
+        // request at most once while being observed.
+        batch_expires,
+        ..Default::default()
+    });
+    let (sub_out_tx, mut sub_out_rx) = mpsc::channel(4);
+    let subscriber = SubscriberBuilder::new()
+        .config(sub_config)
+        .sender(sub_out_tx)
+        .task_id(1)
+        .task_type("nats_jetstream_subscriber")
+        .task_context(test_task_context())
+        .build()
+        .await
+        .expect("build subscriber");
+    let sub_handle = tokio::spawn(async move {
+        use flowgen_core::task::runner::Runner;
+        let _ = subscriber.run().await;
+    });
+
+    // Let connection setup and the first batch request settle, so they are
+    // not counted against the idle window.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let before = server_in_msgs(&varz).await;
+    tokio::time::sleep(idle_window).await;
+    let after = server_in_msgs(&varz).await;
+
+    let requests = after - before;
+    assert!(
+        requests < 20,
+        "an idle subscriber sent {requests} messages in {}s; a parked pull \
+         request renews about once per {}s expiry, so this many means it is \
+         polling the server rather than waiting on it",
+        idle_window.as_secs(),
+        batch_expires.as_secs(),
+    );
+
+    assert!(
+        sub_out_rx.try_recv().is_err(),
+        "an idle subscriber must not emit events when nothing was published"
+    );
+
+    sub_handle.abort();
+}
+
+/// The parked request must not stall delivery: a message published after the
+/// consumer has gone idle still arrives on the already-open batch request.
+#[tokio::test]
+#[ignore = "requires Docker daemon; run in CI via `cargo test -- --ignored`"]
+async fn idle_subscriber_still_delivers_a_message_published_later() {
+    let (_nats, url) = start_nats().await;
+    let stream = stream_options("wake_stream", "wake.subject");
+
+    let sub_config = Arc::new(JsConfig {
+        name: "subscriber".to_string(),
+        url: url.clone(),
+        subject: "wake.subject".to_string(),
+        stream: Some(stream.clone()),
+        durable_name: Some("wake_consumer".to_string()),
+        max_messages_per_batch: 10,
+        batch_expires: Duration::from_secs(30),
+        ack_timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    });
+    let (sub_out_tx, mut sub_out_rx) = mpsc::channel(4);
+    let subscriber = SubscriberBuilder::new()
+        .config(sub_config)
+        .sender(sub_out_tx)
+        .task_id(1)
+        .task_type("nats_jetstream_subscriber")
+        .task_context(test_task_context())
+        .build()
+        .await
+        .expect("build subscriber");
+    let sub_handle = tokio::spawn(async move {
+        use flowgen_core::task::runner::Runner;
+        let _ = subscriber.run().await;
+    });
+
+    // Go idle first, so the message lands on a request that is already parked
+    // rather than on a fresh one.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let pub_config = Arc::new(JsConfig {
+        name: "publisher".to_string(),
+        url: url.clone(),
+        subject: "wake.subject".to_string(),
+        stream: Some(stream),
+        ..Default::default()
+    });
+    let (pub_tx, _pub_out_rx, pub_handle) = spawn_publisher(pub_config).await;
+
+    let event = EventBuilder::new()
+        .data(EventData::Json(serde_json::json!({"payload": 7})))
+        .subject("wake.subject".to_string())
+        .task_id(0)
+        .task_type("test")
+        .build()
+        .expect("build event");
+    pub_tx.send(event).await.expect("publish event");
+
+    let delivered = tokio::time::timeout(Duration::from_secs(10), sub_out_rx.recv())
+        .await
+        .expect("a parked batch request must still deliver a later message")
+        .expect("channel open");
+
+    if let Some(arc) = delivered.completion_tx.as_ref() {
+        arc.signal_completion(None);
+    }
+    assert_eq!(delivered.subject, "wake.subject");
+
+    drop(pub_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), pub_handle).await;
+    sub_handle.abort();
 }

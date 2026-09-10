@@ -7,7 +7,7 @@ use flowgen_core::{
 };
 use std::sync::Arc;
 use tokio::pin;
-use tokio::{sync::mpsc::Sender, time};
+use tokio::sync::mpsc::Sender;
 use tokio_stream::StreamExt;
 use tracing::{error, warn};
 
@@ -39,11 +39,6 @@ pub enum Error {
     ConsumerStream {
         #[source]
         source: async_nats::jetstream::consumer::StreamError,
-    },
-    #[error("Message batch fetch error: {source}")]
-    ConsumerBatch {
-        #[source]
-        source: async_nats::jetstream::consumer::pull::BatchError,
     },
     #[error("Stream management error: {source}")]
     StreamManagement {
@@ -124,7 +119,7 @@ impl EventHandler {
         &self,
         message_result: Result<
             async_nats::jetstream::Message,
-            Box<dyn std::error::Error + Send + Sync>,
+            async_nats::error::Error<async_nats::jetstream::consumer::pull::MessagesErrorKind>,
         >,
     ) -> Result<(), Error> {
         match message_result {
@@ -168,69 +163,58 @@ impl EventHandler {
 
                 Ok(())
             }
-            Err(err) => Err(Error::Other(err)),
+            Err(err) => Err(Error::Other(Box::new(err))),
         }
     }
 
     /// Processes messages from the NATS JetStream consumer.
+    ///
+    /// Uses a continuous pull stream rather than looping over `fetch()` calls.
+    /// `fetch()` returns immediately when no messages are available, which
+    /// caused empty requests to spin at hundreds of round-trips per second on
+    /// an idle consumer. The stream keeps a batch request outstanding with a
+    /// server-side expiry, so the consumer waits on NATS instead of polling.
     async fn handle(self) -> Result<(), Error> {
-        loop {
-            if self.task_context.cancellation_token.is_cancelled() {
-                return Ok(());
-            }
+        if self.task_context.cancellation_token.is_cancelled() {
+            return Ok(());
+        }
 
-            if let Some(delay) = self.config.delay {
-                time::sleep(delay).await
-            }
+        let mut messages = self
+            .consumer
+            .stream()
+            .max_messages_per_batch(self.config.max_messages_per_batch)
+            .expires(self.config.batch_expires)
+            .messages()
+            .await
+            .map_err(|e| Error::ConsumerStream { source: e })?;
 
-            // Fetch messages with / without max_messages setting.
-            let messages = match self.config.max_messages {
-                Some(max_messages) => self
-                    .consumer
-                    .fetch()
-                    .max_messages(max_messages)
-                    .messages()
-                    .await
-                    .map_err(|e| Error::ConsumerBatch { source: e })?,
-                None => self
-                    .consumer
-                    .fetch()
-                    .messages()
-                    .await
-                    .map_err(|e| Error::ConsumerBatch { source: e })?,
-            };
-
-            let mut received = 0u32;
-            match self.config.throttle {
-                Some(throttle_duration) => {
-                    let throttled = messages.throttle(throttle_duration);
-                    pin!(throttled);
-                    while let Some(message_result) = throttled.next().await {
-                        if self.task_context.cancellation_token.is_cancelled() {
-                            return Ok(());
-                        }
-                        received += 1;
-                        self.process_message(message_result).await?;
+        match self.config.throttle {
+            Some(throttle_duration) => {
+                let throttled = messages.throttle(throttle_duration);
+                pin!(throttled);
+                while let Some(message_result) = throttled.next().await {
+                    if self.task_context.cancellation_token.is_cancelled() {
+                        return Ok(());
                     }
-                }
-                None => {
-                    let mut messages = messages;
-                    while let Some(message_result) = messages.next().await {
-                        if self.task_context.cancellation_token.is_cancelled() {
-                            return Ok(());
-                        }
-                        received += 1;
-                        self.process_message(message_result).await?;
-                    }
+                    self.process_message(message_result).await?;
                 }
             }
-
-            if received == 0
-                && self.client.connection_state() == async_nats::connection::State::Disconnected
-            {
-                return Err(Error::StreamEnded);
+            None => {
+                while let Some(message_result) = messages.next().await {
+                    if self.task_context.cancellation_token.is_cancelled() {
+                        return Ok(());
+                    }
+                    self.process_message(message_result).await?;
+                }
             }
         }
+
+        // The continuous stream only ends on an error or a lost connection.
+        if self.client.connection_state() == async_nats::connection::State::Disconnected {
+            return Err(Error::StreamEnded);
+        }
+
+        Ok(())
     }
 }
 
@@ -596,7 +580,7 @@ mod tests {
                 ..Default::default()
             }),
             durable_name: Some("test_consumer".to_string()),
-            max_messages: Some(100),
+            max_messages_per_batch: 100,
             delay: Some(Duration::from_secs(5)),
             throttle: None,
             ..Default::default()
@@ -642,7 +626,7 @@ mod tests {
                 ..Default::default()
             }),
             durable_name: Some("test_consumer".to_string()),
-            max_messages: Some(50),
+            max_messages_per_batch: 50,
             delay: None,
             throttle: None,
             ..Default::default()

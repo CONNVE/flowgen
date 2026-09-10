@@ -19,9 +19,10 @@ use google_cloud_bigquery::{
 };
 use prost_types::{field_descriptor_proto, DescriptorProto, FieldDescriptorProto};
 use serde_json::Value as JsonValue;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tracing::{error, Instrument};
+use tracing::{error, warn, Instrument};
 
 /// Errors that can occur during BigQuery Storage Write operations.
 #[derive(thiserror::Error, Debug)]
@@ -332,6 +333,27 @@ fn encode_nested_value(
     }
 }
 
+/// Reports fields the encoder will drop: it walks the table's schema, so
+/// anything else in the row goes nowhere and nothing says why.
+fn report_unwritable_fields(row: &JsonValue, fields: &[TableFieldSchema], table_id: &str) {
+    let Some(obj) = row.as_object() else {
+        return;
+    };
+    let columns: HashSet<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+    let dropped: Vec<&str> = obj
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !columns.contains(key))
+        .collect();
+    if !dropped.is_empty() {
+        warn!(
+            table = %table_id,
+            fields = %dropped.join(", "),
+            "Dropping fields with no matching column"
+        );
+    }
+}
+
 /// Encodes a JSON value as protobuf bytes according to the table schema.
 /// Handles scalar, repeated (ARRAY), and nested RECORD/STRUCT fields.
 fn json_to_proto_bytes(data: &JsonValue, fields: &[TableFieldSchema]) -> Result<Vec<u8>, Error> {
@@ -450,6 +472,10 @@ impl EventHandler {
                     let json_rows: Vec<JsonValue> = serde_json::from_slice(&json_bytes)
                         .map_err(|source| Error::ProtoEncode { source })?;
 
+                    if let Some(first) = json_rows.first() {
+                        report_unwritable_fields(first, &self.table_fields, &config.table_id);
+                    }
+
                     for row in &json_rows {
                         let mut proto_bytes = json_to_proto_bytes(row, &self.table_fields)?;
                         if let Some(ref change_type) = config.change_type {
@@ -472,6 +498,10 @@ impl EventHandler {
                         JsonValue::Array(arr) => arr.iter().collect(),
                         _ => vec![&data],
                     };
+
+                    if let Some(first) = json_rows.first() {
+                        report_unwritable_fields(first, &self.table_fields, &config.table_id);
+                    }
 
                     let mut rows = Vec::with_capacity(json_rows.len());
                     for row in json_rows {
@@ -748,6 +778,8 @@ impl flowgen_core::task::runner::Runner for Processor {
                                 error_event.error = Some(e.to_string());
                                 if let Some(ref tx) = event_handler.tx {
                                     tx.send(error_event).await.ok();
+                                } else if let Some(arc) = event.completion_tx.as_ref() {
+                                    arc.signal_completion_with_error(e.to_string());
                                 }
                             }
                         }

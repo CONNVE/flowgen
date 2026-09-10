@@ -41,6 +41,32 @@ fn default_use_legacy_sql() -> bool {
     false
 }
 
+/// The file-reference form of a query parameter.
+///
+/// `deny_unknown_fields` holds this to a lone `resource` key. Without it the
+/// untagged enum below also matches an inline object that merely carries a
+/// `resource` field, silently dropping that object's other fields and binding
+/// a file's contents where the flow asked for its own data.
+#[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryParameterResource {
+    /// Resource path, loaded and parsed as JSON.
+    pub resource: String,
+}
+
+/// A query parameter value: either given inline, or loaded from a resource
+/// file. `Resource` is tried first so `{ resource: "..." }` is read as a file
+/// reference rather than as a one-key JSON object.
+#[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum QueryParameterSource {
+    /// Loads the file and parses it as JSON. A non-JSON file is passed
+    /// through as a string.
+    Resource(QueryParameterResource),
+    /// Used as-is.
+    Literal(Value),
+}
+
 /// Configuration structure for BigQuery query operations.
 ///
 /// This structure defines all parameters needed to execute queries against BigQuery,
@@ -165,8 +191,19 @@ pub struct Query {
     pub query: flowgen_core::resource::Source,
     /// Optional query parameters for SQL injection protection.
     /// Keys are parameter names (without @ prefix), values are parameter values.
+    ///
+    /// A value may also be `{ resource: "path/to/file.json" }`, which loads
+    /// the file and passes its parsed contents as the parameter. Use it to
+    /// drive a query from a schema definition the flow already keeps on disk,
+    /// rather than restating that list inside the SQL:
+    ///
+    /// ```yaml
+    /// parameters:
+    ///   table: "Account"
+    ///   schema: { resource: schemas/account_schema.json }
+    /// ```
     #[serde(default)]
-    pub parameters: Option<HashMap<String, Value>>,
+    pub parameters: Option<HashMap<String, QueryParameterSource>>,
     /// Optional BigQuery dataset location (e.g., "US", "EU", "us-central1").
     pub location: Option<String>,
     /// Optional maximum number of rows to return per page.
@@ -646,8 +683,14 @@ mod tests {
     #[test]
     fn test_query_config_creation() {
         let mut parameters = HashMap::new();
-        parameters.insert("status".to_string(), json!("completed"));
-        parameters.insert("start_date".to_string(), json!("2024-01-01"));
+        parameters.insert(
+            "status".to_string(),
+            QueryParameterSource::Literal(json!("completed")),
+        );
+        parameters.insert(
+            "start_date".to_string(),
+            QueryParameterSource::Literal(json!("2024-01-01")),
+        );
 
         let query = Query {
             name: "test_query".to_string(),
@@ -707,12 +750,67 @@ mod tests {
         assert_eq!(query, deserialized);
     }
 
+    /// The untagged enum decides between a file reference and an inline
+    /// value purely on shape, so both spellings are pinned here: a bare
+    /// scalar must stay a literal, and only `{ resource: ... }` may become a
+    /// resource. An inline object that merely *contains* a `resource` key
+    /// alongside others must stay a literal too.
+    #[test]
+    fn parameters_deserialize_resource_and_literal_forms() {
+        let raw = r#"{
+            "name": "params",
+            "project_id": "proj",
+            "query": "SELECT 1",
+            "parameters": {
+                "table": "Account",
+                "count": 5,
+                "schema": { "resource": "schemas/account_schema.json" },
+                "inline_obj": { "resource": "a", "other": "b" }
+            }
+        }"#;
+        let query: Query = serde_json::from_str(raw).expect("parses");
+        let params = query.parameters.expect("parameters present");
+
+        assert_eq!(
+            params.get("table"),
+            Some(&QueryParameterSource::Literal(json!("Account"))),
+            "a bare string must not be read as a resource"
+        );
+        assert_eq!(
+            params.get("count"),
+            Some(&QueryParameterSource::Literal(json!(5)))
+        );
+        assert_eq!(
+            params.get("schema"),
+            Some(&QueryParameterSource::Resource(QueryParameterResource {
+                resource: "schemas/account_schema.json".to_string()
+            })),
+            "a lone `resource` key is the file-reference form"
+        );
+        assert_eq!(
+            params.get("inline_obj"),
+            Some(&QueryParameterSource::Literal(
+                json!({"resource": "a", "other": "b"})
+            )),
+            "an object with extra keys is data, not a file reference"
+        );
+    }
+
     #[test]
     fn test_query_config_with_parameters() {
         let mut parameters = HashMap::new();
-        parameters.insert("customer_id".to_string(), json!("CUST-12345"));
-        parameters.insert("min_amount".to_string(), json!(100.50));
-        parameters.insert("active".to_string(), json!(true));
+        parameters.insert(
+            "customer_id".to_string(),
+            QueryParameterSource::Literal(json!("CUST-12345")),
+        );
+        parameters.insert(
+            "min_amount".to_string(),
+            QueryParameterSource::Literal(json!(100.50)),
+        );
+        parameters.insert(
+            "active".to_string(),
+            QueryParameterSource::Literal(json!(true)),
+        );
 
         let query = Query {
             name: "parameterized_query".to_string(),
@@ -736,9 +834,18 @@ mod tests {
 
         assert!(query.parameters.is_some());
         let params = query.parameters.unwrap();
-        assert_eq!(params.get("customer_id"), Some(&json!("CUST-12345")));
-        assert_eq!(params.get("min_amount"), Some(&json!(100.50)));
-        assert_eq!(params.get("active"), Some(&json!(true)));
+        assert_eq!(
+            params.get("customer_id"),
+            Some(&QueryParameterSource::Literal(json!("CUST-12345")))
+        );
+        assert_eq!(
+            params.get("min_amount"),
+            Some(&QueryParameterSource::Literal(json!(100.50)))
+        );
+        assert_eq!(
+            params.get("active"),
+            Some(&QueryParameterSource::Literal(json!(true)))
+        );
     }
 
     #[test]

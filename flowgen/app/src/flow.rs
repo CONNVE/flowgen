@@ -620,6 +620,11 @@ impl Flow {
         self.task_manager.as_ref().map(Arc::clone)
     }
 
+    /// Returns the cache backing this flow's leases and coordination state.
+    pub fn system_cache(&self) -> Arc<dyn flowgen_core::cache::Cache> {
+        Arc::clone(&self.system_cache)
+    }
+
     /// Returns the cancellation token for the most recently started task tenure.
     ///
     /// Used by the reconciler to cancel a running flow before replacing it. Returns

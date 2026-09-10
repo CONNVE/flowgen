@@ -248,7 +248,7 @@ impl EventHandler {
 
             // Update cache only if flow completed successfully.
             // Failed flows skip cache update, allowing next cron run to retry from same timestamp.
-            if success {
+            if success && !self.task_context.cancellation_token.is_cancelled() {
                 counter += 1;
                 if let Err(cache_err) = cache
                     .put(&cache_key, current_time.to_string().into(), None)
@@ -256,7 +256,6 @@ impl EventHandler {
                 {
                     warn!("Failed to update cache: {:?}", cache_err);
                 }
-                // Persist counter to cache so restarts resume from correct position.
                 if let Err(cache_err) = cache
                     .put(&counter_cache_key, counter.to_string().into(), None)
                     .await

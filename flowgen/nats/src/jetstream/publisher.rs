@@ -477,7 +477,6 @@ mod tests {
                 ..Default::default()
             }),
             durable_name: None,
-            max_messages: None,
             delay: None,
             throttle: None,
             ..Default::default()

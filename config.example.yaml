@@ -9,8 +9,16 @@
 cache:
   enabled: true
   url: "url_of_cache"
-  db_name: "cache_db_name"
   type: nats
+  # Two buckets on this connection, split by who can reach them.
+  # Both are optional; omit either to take the default shown.
+  # runtime:
+  #   # Flow state, reachable from scripts through ctx.cache.
+  #   db_name: "flowgen_cache"
+  # system:
+  #   # Leader-election leases and peer registration. Kept apart from
+  #   # runtime so a flow's script cannot read or overwrite them.
+  #   db_name: "flowgen_system"
   # Optional path to a NATS credentials file.
   # credentials_path: "/etc/nats/credentials.json"
   # Optional: number of historical entries retained per key (defaults to 64,

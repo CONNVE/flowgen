@@ -62,6 +62,48 @@ async fn peer_registry_behaves_correctly_on_nats() {
     peer_registry_behaves_correctly(cache).await;
 }
 
+/// The system bucket must exist whenever the cache does, even with flows
+/// loaded from the filesystem (`flows.cache: None` — the shape every
+/// git_sync deployment uses). It used to be created only as a side effect of
+/// cache-backed flow loading, so those deployments silently kept leases and
+/// peer keys in the runtime bucket, within reach of `ctx.cache`.
+#[tokio::test]
+#[ignore = "requires Docker daemon; run in CI via `cargo test -- --ignored`"]
+async fn system_bucket_is_separate_from_runtime_without_cache_backed_flows() {
+    let (_nats, url) = start_nats().await;
+    let config = app_config_with_cache(url);
+    assert!(
+        config.flows.cache.is_none(),
+        "this test only means something with flows loaded from the filesystem"
+    );
+
+    let system = flowgen::app::App::init_cache(
+        &config,
+        Some(&config.cache.as_ref().unwrap().system.db_name),
+    )
+    .await
+    .expect("system cache init");
+    let runtime = flowgen::app::App::init_cache(&config, None)
+        .await
+        .expect("runtime cache init");
+
+    let registry = PeerRegistry::new(Arc::clone(&system), "pod-a".to_string());
+    registry.register().await.expect("pod-a registers");
+
+    assert_eq!(
+        registry.list_peers().await.expect("list_peers"),
+        vec!["pod-a".to_string()]
+    );
+    assert!(
+        runtime
+            .list_keys("peers.")
+            .await
+            .expect("runtime list_keys")
+            .is_empty(),
+        "peer keys must not be reachable from the runtime bucket that ctx.cache exposes"
+    );
+}
+
 /// `MemoryCache` does not implement TTL at all (`put`'s `ttl_secs` argument
 /// is ignored), so a crashed pod's registration never expires there and this
 /// scenario can only be exercised against a real backend.
@@ -148,6 +190,8 @@ fn app_config_with_cache(url: String) -> flowgen::config::AppConfig {
             credentials_path: None,
             url,
             db_name: None,
+            runtime: flowgen::config::BucketOptions::default(),
+            system: flowgen::config::SystemBucketOptions::default(),
             history: Some(64),
             tombstone_ttl: Some(Duration::from_secs(3600)),
         }),

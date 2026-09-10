@@ -36,6 +36,7 @@ humantime-serde = { workspace = true }
 [dev-dependencies]
 testcontainers = { workspace = true }
 tempfile = { workspace = true }
+reqwest = { workspace = true }
 
 [lints]
 workspace = true

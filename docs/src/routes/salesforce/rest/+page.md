@@ -104,7 +104,7 @@ Batch operations on multiple records: create, get, update, upsert, delete, tree.
 | `name` | string | required | Task name. |
 | `operation` | string | required | `create`, `get`, `update`, `upsert`, `delete`, `tree`. |
 | `credentials_path` | string | required | Path to Salesforce credentials. |
-| `sobject_type` | string | | SObject type. |
+| `sobject_type` | string | | SObject type. When set, records missing `attributes` are auto-populated with `attributes: { type: sobject_type }`. Records that already include `attributes` are left untouched, so mixed-type batches work unchanged. When unset, each record must include `attributes` explicitly or the task errors with a clear message. |
 | `payload` | object | | Records — explicit list or `from_event: true`. |
 | `ids` | list | | Record IDs (for get, delete). |
 | `fields` | list | | Field list (for get). |
@@ -113,6 +113,24 @@ Batch operations on multiple records: create, get, update, upsert, delete, tree.
 | `allow_duplicate_save` | bool | `false` | Send `Sforce-Duplicate-Rule-Header: allowSave=true` so the batch bypasses Salesforce duplicate-detection rules. See [Duplicate-rule override](#duplicate-rule-override). |
 | `depends_on` | list | | Upstream task names. |
 | `retry` | object | | [Retry configuration](/docs/flowgen/concepts/retry). |
+
+### Auto-populated `attributes`
+
+The Salesforce Composite API requires every record to include an `attributes: { type: "..." }` sub-object. When `sobject_type` is set on the task, flowgen auto-populates it for any record that doesn't already have one, so simple single-type batches don't need boilerplate:
+
+```yaml
+- salesforce_restapi_composite:
+    name: bulk_create
+    operation: create
+    credentials_path: /etc/salesforce/credentials.json
+    sobject_type: Account
+    payload:
+      from_event: true
+```
+
+Each incoming event record needs only its fields — `attributes: { type: "Account" }` is injected automatically.
+
+For mixed-type batches (e.g. Accounts and Contacts in the same request), set `attributes` on each record explicitly. flowgen never overwrites an existing `attributes` key.
 
 ## Duplicate-rule override
 

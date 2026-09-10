@@ -80,6 +80,20 @@ impl PeerRegistry {
 
     /// Registers this pod in the cache. Call once at startup.
     pub async fn register(&self) -> Result<(), crate::cache::Error> {
+        self.renew_internal().await?;
+        info!(identity = %self.identity, "Registered peer");
+        Ok(())
+    }
+
+    /// Renews this pod's registration in the cache without logging at INFO
+    /// level, so background heartbeats don't spam the logs.
+    async fn renew(&self) -> Result<(), crate::cache::Error> {
+        self.renew_internal().await?;
+        debug!(identity = %self.identity, "Renewed peer registration");
+        Ok(())
+    }
+
+    async fn renew_internal(&self) -> Result<(), crate::cache::Error> {
         let key = format!("{PEER_KEY_PREFIX}{}", self.identity);
         self.cache
             .put(
@@ -87,9 +101,7 @@ impl PeerRegistry {
                 Bytes::from(self.identity.clone()),
                 Some(self.ttl_secs),
             )
-            .await?;
-        info!(identity = %self.identity, "Registered peer");
-        Ok(())
+            .await
     }
 
     /// Spawns a background task that renews the peer registration at the
@@ -97,8 +109,9 @@ impl PeerRegistry {
     pub fn spawn_renewal(&self, cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
         let registry = self.clone();
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(registry.renewal_secs));
+            let renewal_duration = std::time::Duration::from_secs(registry.renewal_secs);
+            let start = tokio::time::Instant::now() + renewal_duration;
+            let mut interval = tokio::time::interval_at(start, renewal_duration);
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
@@ -106,7 +119,7 @@ impl PeerRegistry {
                         break;
                     }
                     _ = interval.tick() => {
-                        if let Err(e) = registry.register().await {
+                        if let Err(e) = registry.renew().await {
                             warn!(error = %e, "Failed to renew peer registration");
                         }
                     }

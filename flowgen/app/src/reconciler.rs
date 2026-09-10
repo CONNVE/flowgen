@@ -64,10 +64,13 @@ pub enum Error {
 
 /// All dependencies the reconciler needs to build and start replacement flows.
 pub struct ReconcilerContext {
-    /// System cache. Watched for flow YAML changes and used for stale-entry
-    /// cleanup, leader-election leases, and other cluster-wide coordination
-    /// state. Passed to rebuilt flows as their `system_cache`.
+    /// Flow cache. Watched for flow YAML changes and used for stale-entry
+    /// cleanup. Holds the flow definitions, which may sit in a different
+    /// bucket than the coordination state in `system_cache`.
     pub cache: Arc<dyn Cache>,
+    /// System cache. Holds leader-election leases and other cluster-wide
+    /// coordination state; passed to rebuilt flows as their `system_cache`.
+    pub system_cache: Arc<dyn Cache>,
     /// Runtime cache. Holds per-flow state (replay IDs, counters, last-run
     /// timestamps) and is exposed to user scripts via `ctx.cache`. Passed
     /// to rebuilt flows as their `cache`. May be the same `Arc` as
@@ -548,6 +551,7 @@ fn test_context(prefix: &str) -> ReconcilerContext {
     let holder_identity = "test-pod".to_string();
     ReconcilerContext {
         cache: Arc::clone(&shared),
+        system_cache: Arc::clone(&shared),
         runtime_cache: Arc::clone(&shared),
         app_config: Arc::new(app_config),
         resource_loader: None,
@@ -574,7 +578,7 @@ fn build_flow(
     let mut builder = crate::flow::FlowBuilder::new()
         .config(Arc::new(flow_config))
         .cache(Arc::clone(&ctx.runtime_cache))
-        .system_cache(Arc::clone(&ctx.cache))
+        .system_cache(Arc::clone(&ctx.system_cache))
         .client_registry(Arc::clone(&ctx.client_registry))
         .holder_identity(ctx.holder_identity.clone())
         .peer_registry(Arc::clone(&ctx.peer_registry));
@@ -654,6 +658,7 @@ mod tests {
         let holder_identity = "test-pod".to_string();
         let ctx = ReconcilerContext {
             cache: Arc::clone(&shared),
+            system_cache: Arc::clone(&shared),
             runtime_cache: Arc::clone(&shared),
             app_config: Arc::new(app_config),
             resource_loader: None,
@@ -787,6 +792,7 @@ flow:
         let holder_identity = "test-pod".to_string();
         ReconcilerContext {
             cache: Arc::clone(&shared),
+            system_cache: Arc::clone(&shared),
             runtime_cache: Arc::clone(&shared),
             app_config: Arc::new(app_config),
             resource_loader: None,
@@ -896,5 +902,74 @@ flow:
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// A rebuilt flow must take its lease from `system_cache`, not from the
+    /// bucket the flow YAML was read from. The two are the same object in a
+    /// default deployment, so this gives the reconciler three distinct caches
+    /// to make a mix-up observable.
+    #[tokio::test]
+    async fn rebuilt_flow_leases_from_the_system_cache_not_the_flow_cache() {
+        let mut ctx = test_context("flows");
+        let flow_cache: Arc<dyn Cache> = Arc::new(flowgen_core::cache::memory::MemoryCache::new());
+        let system_cache: Arc<dyn Cache> =
+            Arc::new(flowgen_core::cache::memory::MemoryCache::new());
+        let runtime_cache: Arc<dyn Cache> =
+            Arc::new(flowgen_core::cache::memory::MemoryCache::new());
+        ctx.cache = Arc::clone(&flow_cache);
+        ctx.system_cache = Arc::clone(&system_cache);
+        ctx.runtime_cache = Arc::clone(&runtime_cache);
+
+        let yaml = r#"
+flow:
+  require_leader_election: true
+  tasks:
+    - generate:
+        name: tick
+    - log:
+        name: out
+"#;
+        let (raw, _) = parse_flow_config("flows.lease-target", &bytes::Bytes::from(yaml))
+            .expect("parse flow yaml");
+        let config =
+            FlowConfig::from_path(raw, "lease-target".to_string(), None).expect("build config");
+
+        let flow = build_flow(config, &ctx).expect("build flow");
+        let lease_cache = flow.system_cache();
+
+        lease_cache
+            .put(
+                &format!("{}lease-target", flowgen_core::executor::LEASE_KEY_PREFIX),
+                bytes::Bytes::from_static(b"held"),
+                None,
+            )
+            .await
+            .expect("write a lease through the flow's system cache");
+
+        assert_eq!(
+            system_cache
+                .list_keys(flowgen_core::executor::LEASE_KEY_PREFIX)
+                .await
+                .expect("list system lease keys")
+                .len(),
+            1,
+            "the flow's lease writes must land in the system cache"
+        );
+        assert!(
+            flow_cache
+                .list_keys(flowgen_core::executor::LEASE_KEY_PREFIX)
+                .await
+                .expect("list flow lease keys")
+                .is_empty(),
+            "no lease may land in the bucket holding flow definitions"
+        );
+        assert!(
+            runtime_cache
+                .list_keys(flowgen_core::executor::LEASE_KEY_PREFIX)
+                .await
+                .expect("list runtime lease keys")
+                .is_empty(),
+            "no lease may land in the script-reachable runtime bucket"
+        );
     }
 }

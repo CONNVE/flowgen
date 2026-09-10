@@ -84,20 +84,22 @@ spec:
         - name: health
           containerPort: {{ default 8081 (dig "health" "port" nil $worker) }}
           protocol: TCP
+        {{- $probes := dig "health" "probes" dict $worker }}
+        startupProbe:
+          httpGet:
+            path: /livez
+            port: health
+          {{- toYaml (dig "startup" dict $probes) | nindent 10 }}
         readinessProbe:
           httpGet:
             path: /readyz
             port: health
-          initialDelaySeconds: 5
-          periodSeconds: 10
-          failureThreshold: 3
+          {{- toYaml (dig "readiness" dict $probes) | nindent 10 }}
         livenessProbe:
           httpGet:
             path: /livez
             port: health
-          initialDelaySeconds: 10
-          periodSeconds: 15
-          failureThreshold: 3
+          {{- toYaml (dig "liveness" dict $probes) | nindent 10 }}
         resources:
           {{- toYaml $worker.resources | nindent 12 }}
         volumeMounts:

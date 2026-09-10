@@ -42,7 +42,10 @@ cache:
   type: nats
   credentials_path: /etc/nats/credentials.json
   url: "{{env.NATS_URL}}"
-  db_name: flowgen_cache
+  runtime:
+    db_name: flowgen_cache
+  system:
+    db_name: flowgen_system
   history: 10
   tombstone_ttl: "1h"
 
@@ -122,7 +125,8 @@ Distributed cache backend. When omitted, flowgen uses an in-memory cache (single
 | `type` | string | required | Backend type. Currently `nats`. |
 | `credentials_path` | string | optional | Path to NATS credentials file. |
 | `url` | string | `localhost:4222` | NATS server URL. |
-| `db_name` | string | `flowgen_cache` | KV bucket name. |
+| `runtime.db_name` | string | `flowgen_cache` | KV bucket for flow state, reachable from scripts via `ctx.cache`. |
+| `system.db_name` | string | `flowgen_system` | KV bucket for leader-election leases and peer registration. Kept apart from `runtime` so scripts cannot reach coordination state. Created whenever the cache is enabled. |
 | `history` | int | `64` | Historical entries retained per key. Only applies when the bucket is created. Server caps at 64. |
 | `tombstone_ttl` | duration | `1h` | TTL for delete/purge tombstones. Required for per-key TTLs on cache entries to work. |
 

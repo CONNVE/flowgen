@@ -171,6 +171,11 @@ pub struct Composite {
     pub operation: CompositeOperation,
     pub credentials_path: PathBuf,
 
+    /// SObject type (e.g., "Account", "Contact"). When set, records
+    /// missing `attributes` are auto-populated with
+    /// `attributes: { type: sobject_type }`. Records that already
+    /// include `attributes` are left untouched. Required for `get`,
+    /// `upsert`, and `tree` operations.
     #[serde(default)]
     pub sobject_type: Option<String>,
 
