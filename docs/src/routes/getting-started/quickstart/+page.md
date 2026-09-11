@@ -57,7 +57,10 @@ cache:
   type: nats
   credentials_path: /etc/nats/credentials.json
   url: "{{env.NATS_URL}}"
-  db_name: flowgen_cache
+  # runtime:
+  #   db_name: flowgen_cache
+  # system:
+  #   db_name: flowgen_system
   # history: 10
   # tombstone_ttl: "1h"
 

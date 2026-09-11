@@ -83,6 +83,10 @@ pub async fn create_or_update_stream(
                 })
                 .unwrap_or(existing_config.discard);
 
+            let discard_new_per_subject = stream_opts
+                .discard_new_per_subject
+                .unwrap_or(existing_config.discard_new_per_subject);
+
             let max_age = stream_opts.max_age.unwrap_or(existing_config.max_age);
 
             let max_messages_per_subject = stream_opts
@@ -136,6 +140,7 @@ pub async fn create_or_update_stream(
                 max_consumers,
                 subjects,
                 discard,
+                discard_new_per_subject,
                 retention,
                 max_age,
                 duplicate_window,
@@ -193,6 +198,10 @@ pub async fn create_or_update_stream(
                     super::config::DiscardPolicy::Old => jetstream::stream::DiscardPolicy::Old,
                     super::config::DiscardPolicy::New => jetstream::stream::DiscardPolicy::New,
                 };
+            }
+
+            if let Some(discard_new_per_subject) = stream_opts.discard_new_per_subject {
+                stream_config.discard_new_per_subject = discard_new_per_subject;
             }
 
             if let Some(max_age) = stream_opts.max_age {

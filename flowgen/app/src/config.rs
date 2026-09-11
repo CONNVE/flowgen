@@ -414,6 +414,35 @@ pub struct AppConfig {
     pub telemetry: Option<TelemetryOptions>,
 }
 
+/// Rejected configuration, reported before anything starts.
+#[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
+pub enum ValidationError {
+    #[error(
+        "`cache.db_name` was renamed to `cache.runtime.db_name` in 0.135. Rename it to keep \
+         using bucket {db_name:?} — leaving it in place would silently fall back to the \
+         default bucket and strand the existing data:\n\
+         \x20 cache:\n\
+         \x20   runtime:\n\
+         \x20     db_name: {db_name:?}"
+    )]
+    RenamedCacheDbName { db_name: String },
+}
+
+impl AppConfig {
+    /// Rejects configuration that would otherwise be accepted with the wrong
+    /// meaning. Serde ignores unknown keys, so a renamed field needs an
+    /// explicit check to avoid changing behaviour on upgrade without a word.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        match self.cache.as_ref().and_then(|c| c.db_name.as_ref()) {
+            Some(db_name) => Err(ValidationError::RenamedCacheDbName {
+                db_name: db_name.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Cache type for storage backend.
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -436,8 +465,19 @@ pub struct CacheOptions {
     /// NATS server URL (e.g., "nats://localhost:4222"). Defaults to "localhost:4222".
     #[serde(default = "default_nats_url")]
     pub url: String,
-    /// Cache database name (defaults to DEFAULT_CACHE_DB if not provided).
+    /// Pre-0.135 spelling of `runtime.db_name`. Kept solely to reject it:
+    /// serde ignores unknown keys, so without this an upgraded config would
+    /// silently fall back to the default bucket and leave the operator's data
+    /// in the old one.
+    #[serde(default)]
     pub db_name: Option<String>,
+    /// Runtime bucket, reachable from scripts through `ctx.cache`.
+    #[serde(default)]
+    pub runtime: BucketOptions,
+    /// System bucket holding leader-election leases and peer registration.
+    /// Kept apart from `runtime` so scripts cannot reach coordination state.
+    #[serde(default)]
+    pub system: SystemBucketOptions,
     /// Number of historical entries retained per key in the KV bucket.
     /// Only applies when the bucket is created; changing this on an existing
     /// bucket has no effect. Defaults to 10.
@@ -449,6 +489,48 @@ pub struct CacheOptions {
     /// Defaults to 1 hour.
     #[serde(default, with = "humantime_serde")]
     pub tombstone_ttl: Option<std::time::Duration>,
+}
+
+/// Runtime bucket options.
+#[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+pub struct BucketOptions {
+    /// Bucket name (defaults to "flowgen_cache").
+    #[serde(default = "default_runtime_db_name")]
+    pub db_name: String,
+}
+
+impl Default for BucketOptions {
+    fn default() -> Self {
+        Self {
+            db_name: default_runtime_db_name(),
+        }
+    }
+}
+
+/// System bucket options.
+///
+/// Both buckets sit on the connection `CacheOptions` describes, so this
+/// inherits `url`, `credentials_path`, and `type`. With the cache disabled
+/// the bucket falls back to an in-memory store, which cannot coordinate
+/// across pods — see the warning `App` emits for leader-elected flows.
+#[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+pub struct SystemBucketOptions {
+    /// Bucket name (defaults to "flowgen_system").
+    #[serde(default = "default_system_db_name")]
+    pub db_name: String,
+}
+
+impl Default for SystemBucketOptions {
+    fn default() -> Self {
+        Self {
+            db_name: default_system_db_name(),
+        }
+    }
+}
+
+/// Default bucket name for the runtime cache.
+fn default_runtime_db_name() -> String {
+    DEFAULT_CACHE_DB_NAME.to_string()
 }
 
 /// Flow loading configuration.
@@ -1029,6 +1111,8 @@ mod tests {
                 credentials_path: Some(PathBuf::from("/test/cache")),
                 url: "localhost:4222".to_string(),
                 db_name: None,
+                runtime: BucketOptions::default(),
+                system: SystemBucketOptions::default(),
                 history: None,
                 tombstone_ttl: None,
             }),
@@ -1088,7 +1172,11 @@ mod tests {
                 cache_type: CacheType::Nats,
                 credentials_path: Some(PathBuf::from("/serialize/cache")),
                 url: "localhost:4222".to_string(),
-                db_name: Some("test_db".to_string()),
+                db_name: None,
+                runtime: BucketOptions {
+                    db_name: "test_db".to_string(),
+                },
+                system: SystemBucketOptions::default(),
                 history: None,
                 tombstone_ttl: None,
             }),
@@ -1121,6 +1209,8 @@ mod tests {
                 credentials_path: Some(PathBuf::from("/clone/cache")),
                 url: "localhost:4222".to_string(),
                 db_name: None,
+                runtime: BucketOptions::default(),
+                system: SystemBucketOptions::default(),
                 history: None,
                 tombstone_ttl: None,
             }),
@@ -1144,6 +1234,45 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_pre_0_135_cache_db_name() {
+        let yaml = r#"
+cache:
+  enabled: true
+  type: nats
+  url: "localhost:4222"
+  db_name: "legacy_bucket"
+flows:
+  path: "/flows"
+"#;
+        let config: AppConfig = serde_yaml::from_str(yaml).expect("parses");
+        let err = config.validate().expect_err("renamed key must be rejected");
+        assert!(
+            err.to_string().contains("legacy_bucket"),
+            "the error must name the bucket the operator would lose: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_the_new_bucket_layout() {
+        let yaml = r#"
+cache:
+  enabled: true
+  type: nats
+  url: "localhost:4222"
+  runtime:
+    db_name: "legacy_bucket"
+flows:
+  path: "/flows"
+"#;
+        let config: AppConfig = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(
+            config.cache.as_ref().unwrap().runtime.db_name,
+            "legacy_bucket"
+        );
+        config.validate().expect("new layout is accepted");
+    }
+
+    #[test]
     fn test_cache_options_creation() {
         let cache_options = CacheOptions {
             enabled: true,
@@ -1151,6 +1280,8 @@ mod tests {
             credentials_path: Some(PathBuf::from("/test/credentials_path")),
             url: "localhost:4222".to_string(),
             db_name: None,
+            runtime: BucketOptions::default(),
+            system: SystemBucketOptions::default(),
             history: None,
             tombstone_ttl: None,
         };
@@ -1169,7 +1300,11 @@ mod tests {
             cache_type: CacheType::Nats,
             credentials_path: Some(PathBuf::from("/disabled/cache")),
             url: "localhost:4222".to_string(),
-            db_name: Some("custom_db".to_string()),
+            db_name: None,
+            runtime: BucketOptions {
+                db_name: "custom_db".to_string(),
+            },
+            system: SystemBucketOptions::default(),
             history: None,
             tombstone_ttl: None,
         };
@@ -1189,6 +1324,8 @@ mod tests {
             credentials_path: Some(PathBuf::from("/serialize/credentials_path")),
             url: "localhost:4222".to_string(),
             db_name: None,
+            runtime: BucketOptions::default(),
+            system: SystemBucketOptions::default(),
             history: None,
             tombstone_ttl: None,
         };

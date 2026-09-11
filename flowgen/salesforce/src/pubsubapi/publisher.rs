@@ -3,13 +3,14 @@ use chrono::Utc;
 use flowgen_core::client::Client;
 use flowgen_core::config::ConfigExt;
 use flowgen_core::event::{Event, EventData, EventExt};
+use flowgen_core::task::runner::Runner;
 use futures_util::future;
 use salesforce_core::pubsubapi::{
     ProducerEvent, PubSubError, PublishRequest, SchemaRequest, TopicRequest,
 };
 use std::sync::Arc;
 use tokio::sync::{mpsc::Receiver, Mutex};
-use tracing::{error, Instrument};
+use tracing::{error, warn, Instrument};
 
 /// Checks if a gRPC error is due to invalid authentication.
 fn is_auth_error(error: &PubSubError) -> bool {
@@ -92,6 +93,11 @@ pub struct EventHandler {
     config: Arc<super::config::Publisher>,
     /// Pub/Sub connection context.
     pubsub: Arc<Mutex<salesforce_core::pubsubapi::Client>>,
+    /// Registry keys for the cached gRPC channel and Salesforce client, so a
+    /// rebuild after a failed publish evicts the entries that just went stale
+    /// instead of handing the replacement the same dead connection.
+    channel_key: flowgen_core::client_registry::ClientKey,
+    client_key: flowgen_core::client_registry::ClientKey,
     /// Topic name for publishing.
     topic: String,
     /// Schema ID for event serialization.
@@ -234,6 +240,31 @@ pub struct Publisher {
     task_type: &'static str,
 }
 
+impl Publisher {
+    /// Builds an `EventHandler`, retrying on failure with the init strategy.
+    /// Used both for the initial connection and to rebuild it after a publish
+    /// exhausts its retries.
+    async fn init_retrying(
+        &self,
+        retry_config: &flowgen_core::retry::RetryConfig,
+    ) -> Result<Arc<EventHandler>, Error> {
+        tokio_retry::Retry::spawn(
+            retry_config.init_strategy(self.task_context.startup_delay),
+            || async {
+                match self.init().await {
+                    Ok(handler) => Ok(handler),
+                    Err(e) => {
+                        error!(error = %e, "Failed to initialize publisher");
+                        Err(tokio_retry::RetryError::transient(e))
+                    }
+                }
+            },
+        )
+        .await
+        .map(Arc::new)
+    }
+}
+
 #[async_trait::async_trait]
 impl flowgen_core::task::runner::Runner for Publisher {
     type Error = Error;
@@ -248,39 +279,59 @@ impl flowgen_core::task::runner::Runner for Publisher {
     async fn init(&self) -> Result<EventHandler, Error> {
         let init_config = self.config.render(&serde_json::json!({}))?;
 
-        let service = flowgen_core::service::ServiceBuilder::new()
-            .endpoint(format!(
+        let endpoint = match &init_config.endpoint {
+            Some(endpoint) => endpoint.clone(),
+            None => format!(
                 "{}:{}",
                 super::config::DEFAULT_PUBSUB_URL,
                 super::config::DEFAULT_PUBSUB_PORT
-            ))
-            .build()
-            .map_err(|e| Error::Service { source: e })?
-            .connect()
-            .await
-            .map_err(|e| Error::Service { source: e })?;
+            ),
+        };
 
-        let channel = service.channel.ok_or_else(|| Error::Service {
-            source: flowgen_core::service::Error::MissingEndpoint(),
-        })?;
+        // Shared per endpoint, so a publisher and subscriber pointed at the
+        // same org multiplex over one HTTP/2 connection rather than holding
+        // one each, with a keepalive on each.
+        let channel_key = flowgen_core::client_registry::ClientKeyBuilder::new("salesforce_pubsub")
+            .field("grpc_endpoint", &endpoint)
+            .build();
+        let channel = self
+            .task_context
+            .client_registry
+            .get_or_init(channel_key.clone(), || async {
+                let service = flowgen_core::service::ServiceBuilder::new()
+                    .endpoint(endpoint)
+                    .build()
+                    .map_err(|e| Error::Service { source: e })?
+                    .connect()
+                    .await
+                    .map_err(|e| Error::Service { source: e })?;
+                service.channel.ok_or_else(|| Error::Service {
+                    source: flowgen_core::service::Error::MissingEndpoint(),
+                })
+            })
+            .await
+            .map_err(|e| match e {
+                flowgen_core::client_registry::Error::Init { source } => source,
+                flowgen_core::client_registry::Error::TypeMismatch => Error::ClientRegistryMismatch,
+            })?;
+        let channel = (*channel).clone();
 
         let credentials_path = init_config.credentials_path.clone();
+        let client_key =
+            flowgen_core::client_registry::ClientKey::new(self.task_type, &credentials_path);
         let sfdc_client = self
             .task_context
             .client_registry
-            .get_or_init(
-                flowgen_core::client_registry::ClientKey::new(self.task_type, &credentials_path),
-                || async {
-                    let client = salesforce_core::client::Builder::new()
-                        .credentials_path(credentials_path)
-                        .build()
-                        .map_err(|e| Error::Auth { source: e })?
-                        .connect()
-                        .await
-                        .map_err(|e| Error::Auth { source: e })?;
-                    Ok(tokio::sync::Mutex::new(client))
-                },
-            )
+            .get_or_init(client_key.clone(), || async {
+                let client = salesforce_core::client::Builder::new()
+                    .credentials_path(credentials_path)
+                    .build()
+                    .map_err(|e| Error::Auth { source: e })?
+                    .connect()
+                    .await
+                    .map_err(|e| Error::Auth { source: e })?;
+                Ok(tokio::sync::Mutex::new(client))
+            })
             .await
             .map_err(|e| match e {
                 flowgen_core::client_registry::Error::Init { source } => source,
@@ -321,6 +372,8 @@ impl flowgen_core::task::runner::Runner for Publisher {
         let event_handler = EventHandler {
             config: Arc::clone(&self.config),
             pubsub,
+            channel_key,
+            client_key,
             topic: init_config.topic.to_owned(),
             schema_id: schema_info.schema_id,
             schema: Arc::new(schema),
@@ -337,26 +390,20 @@ impl flowgen_core::task::runner::Runner for Publisher {
         let retry_config =
             flowgen_core::retry::RetryConfig::merge(&self.task_context.retry, &self.config.retry);
 
-        let event_handler = match tokio_retry::Retry::spawn(
-            retry_config.init_strategy(self.task_context.startup_delay),
-            || async {
-                match self.init().await {
-                    Ok(handler) => Ok(handler),
-                    Err(e) => {
-                        error!(error = %e, "Failed to initialize publisher");
-                        Err(tokio_retry::RetryError::transient(e))
-                    }
-                }
-            },
-        )
-        .await
-        {
-            Ok(handler) => Arc::new(handler),
-            Err(e) => {
-                return Err(e);
-            }
-        };
+        // The loop holds the receiver mutably while `init_retrying` borrows
+        // the rest of `self` to rebuild, so it moves out here. The channel
+        // left behind is never read.
+        let mut rx = std::mem::replace(&mut self.rx, tokio::sync::mpsc::channel(1).1);
 
+        let mut event_handler = self.init_retrying(&retry_config).await?;
+
+        // Set by a publish that exhausted its retries. The gRPC channel is
+        // established once at init and never repaired in place, so a dropped
+        // connection would otherwise leave this task publishing into a dead
+        // transport until the pod restarts. Rebuilding before the next event
+        // reconnects instead — the same "reconnect on event-loop failure"
+        // the subscriber already does.
+        let needs_reinit = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut handlers = Vec::new();
 
         loop {
@@ -365,10 +412,47 @@ impl flowgen_core::task::runner::Runner for Publisher {
                 return Ok(());
             }
 
-            match self.rx.recv().await {
+            match rx.recv().await {
                 Some(event) => {
-                    if Some(event.task_id) == event_handler.task_id.checked_sub(1) {
+                    // Only events this task will actually publish are worth a
+                    // rebuild; one addressed to a different task is dropped by
+                    // the check below and must not trigger a reconnect.
+                    let ours = Some(event.task_id) == event_handler.task_id.checked_sub(1);
+
+                    if ours && needs_reinit.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                        warn!("Rebuilding publisher connection after failed publish");
+                        self.task_context
+                            .client_registry
+                            .remove(&event_handler.channel_key)
+                            .await;
+                        self.task_context
+                            .client_registry
+                            .remove(&event_handler.client_key)
+                            .await;
+                        let rebuilt = tokio::select! {
+                            _ = self.task_context.cancellation_token.cancelled() => {
+                                future::join_all(handlers).await;
+                                return Ok(());
+                            }
+                            result = self.init_retrying(&retry_config) => result,
+                        };
+                        match rebuilt {
+                            Ok(handler) => event_handler = handler,
+                            Err(e) => {
+                                // Keep the old handler and let the next event
+                                // try again: a publisher that gives up here
+                                // would stay dead for the pod's lifetime,
+                                // which is the failure this rebuild exists
+                                // to prevent.
+                                error!(error = %e, "Failed to rebuild publisher connection, will retry on next event");
+                                needs_reinit.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                        }
+                    }
+
+                    if ours {
                         let event_handler = Arc::clone(&event_handler);
+                        let needs_reinit = Arc::clone(&needs_reinit);
                         let retry_strategy = retry_config.strategy();
                         let handle = tokio::spawn(
                             async move {
@@ -407,6 +491,7 @@ impl flowgen_core::task::runner::Runner for Publisher {
 
                                 if let Err(err) = result {
                                     error!(error = %err, "Failed to publish message after all retry attempts");
+                                    needs_reinit.store(true, std::sync::atomic::Ordering::Release);
                                     let mut error_event = event.clone();
                                     error_event.error = Some(err.to_string());
                                     if let Some(ref tx) = event_handler.tx {

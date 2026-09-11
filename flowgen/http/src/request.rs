@@ -63,6 +63,11 @@ pub enum Error {
         #[source]
         source: serde_json::Error,
     },
+    #[error("OAuth 2.0 token fetch failed: {source}")]
+    OAuth2TokenFetch {
+        #[source]
+        source: flowgen_core::credentials::OAuth2Error,
+    },
     #[error("Config template rendering error: {source}")]
     ConfigRender {
         #[source]
@@ -211,12 +216,12 @@ impl EventHandler {
             }
 
             if let Some(credentials) = &self.credentials {
-                if let Some(bearer_token) = &credentials.bearer_auth {
-                    client = client.bearer_auth(bearer_token);
-                }
-
-                if let Some(basic_auth) = &credentials.basic_auth {
-                    client = client.basic_auth(&basic_auth.username, Some(&basic_auth.password));
+                let header_value = credentials
+                    .authorization_header_async()
+                    .await
+                    .map_err(|source| Error::OAuth2TokenFetch { source })?;
+                if let Some(header_value) = header_value {
+                    client = client.header(reqwest::header::AUTHORIZATION, header_value);
                 }
             }
 
@@ -581,31 +586,15 @@ mod tests {
 
     #[test]
     fn test_credentials_creation() {
-        let basic_auth = BasicAuth {
-            username: "testuser".to_string(),
-            password: "testpass".to_string(),
-        };
-
-        let creds = HttpCredentials {
-            bearer_auth: Some("bearer_token_123".to_string()),
-            basic_auth: Some(basic_auth.clone()),
-        };
+        let creds = HttpCredentials::bearer("bearer_token_123");
 
         assert_eq!(creds.bearer_auth, Some("bearer_token_123".to_string()));
-        assert_eq!(creds.basic_auth, Some(basic_auth));
+        assert!(creds.basic_auth.is_none());
     }
 
     #[test]
     fn test_credentials_serialization() {
-        let basic_auth = BasicAuth {
-            username: "user".to_string(),
-            password: "pass".to_string(),
-        };
-
-        let creds = HttpCredentials {
-            bearer_auth: Some("token".to_string()),
-            basic_auth: Some(basic_auth),
-        };
+        let creds = HttpCredentials::bearer("token");
 
         let json = serde_json::to_string(&creds).unwrap();
         let deserialized: HttpCredentials = serde_json::from_str(&json).unwrap();

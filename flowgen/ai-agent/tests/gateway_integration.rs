@@ -1002,10 +1002,7 @@ fn register_proxy_with_bearer_token(
         description: None,
         protocol,
         config,
-        credentials: Some(HttpCredentials {
-            bearer_auth: Some(token.to_string()),
-            basic_auth: None,
-        }),
+        credentials: Some(HttpCredentials::bearer(token)),
         auth_provider: None,
         tx,
         task_id: 0,

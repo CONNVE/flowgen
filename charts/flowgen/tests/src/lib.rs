@@ -288,3 +288,30 @@ fn probes_point_to_dedicated_health_port() {
         Some("health")
     );
 }
+
+/// Every probe sets `timeoutSeconds`, and a startupProbe exists.
+///
+/// Leaving `timeoutSeconds` unset is the bug worth catching: Kubernetes
+/// defaults it to 1s, so a worker merely busy enough to delay the handler
+/// gets restarted, losing in-flight work and shifting load onto replicas
+/// that then time out too. What the values should be is a deployment
+/// decision — this only asserts they were made deliberately.
+#[test]
+fn probes_set_their_timeout_explicitly() {
+    let manifests = render("");
+    let deployment = find_deployment(&manifests);
+    let container = container(pod_spec(&deployment));
+
+    for probe in ["startupProbe", "readinessProbe", "livenessProbe"] {
+        let value = container
+            .get(probe)
+            .unwrap_or_else(|| panic!("container should have a {probe}"));
+        assert!(
+            value
+                .get("timeoutSeconds")
+                .and_then(|v| v.as_u64())
+                .is_some(),
+            "{probe} must set timeoutSeconds; unset means Kubernetes' 1s default"
+        );
+    }
+}

@@ -105,6 +105,26 @@ flowgen:
   health:
     port: 8081
 
+    # Probe tuning. Set timeoutSeconds explicitly on all three: the
+    # Kubernetes default is 1s, which restarts a worker that is merely busy.
+    probes:
+      # Covers slow starts, so the other two need no initialDelaySeconds.
+      startup:
+        periodSeconds: 5
+        timeoutSeconds: 3
+        failureThreshold: 12
+      # Sensitive: removing a pod from the load balancer is reversible.
+      readiness:
+        periodSeconds: 10
+        timeoutSeconds: 3
+        failureThreshold: 3
+      # Slack: this restarts the pod. periodSeconds x failureThreshold is
+      # how long a worker may be unresponsive first — 75s by default.
+      liveness:
+        periodSeconds: 15
+        timeoutSeconds: 5
+        failureThreshold: 5
+
   serviceAccount:
     # Specifies whether a service account should be created
     create: true

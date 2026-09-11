@@ -1,0 +1,37 @@
+# Keep a table's columns in step with a schema file, without restating the
+# column list in SQL. The schema is passed as a parameter, so adding a field
+# means editing one file.
+#
+# Required:
+#   - GCP service account at /etc/gcp/credentials.json
+#   - resources/schemas/orders_schema.json (the column list)
+#   - resources/gcp/queries/add_missing_columns.sql (diffs against the table)
+flow:
+  labels:
+    display_name: "BigQuery Schema Parameter"
+    description: "Adds columns missing from a table by passing a schema resource file as a query parameter, diffing against INFORMATION_SCHEMA so a run with nothing to add costs no quota."
+    tags: ["bigquery", "gcp", "query", "schema", "example"]
+  require_leader_election: true
+  tasks:
+
+    # Runs once per start; safe to rerun because the query adds only what is absent.
+    - generate:
+        name: trigger
+        count: 1
+
+    - gcp_bigquery_query:
+        name: add_missing_columns
+        credentials_path: /etc/gcp/credentials.json
+        project_id: my-project-id
+        query:
+          resource: "gcp/queries/add_missing_columns.sql"
+        parameters:
+          table_name: "orders"
+          # Loaded and parsed, then bound as a BigQuery JSON parameter.
+          schema:
+            resource: "schemas/orders_schema.json"
+        timeout: "1m"
+
+    - log:
+        name: log
+        level: info

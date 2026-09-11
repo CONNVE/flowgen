@@ -370,6 +370,8 @@ impl flowgen_core::task::runner::Runner for Processor {
                                 error_event.error = Some(e.to_string());
                                 if let Some(ref tx) = event_handler.tx {
                                     tx.send(error_event).await.ok();
+                                } else if let Some(arc) = event.completion_tx.as_ref() {
+                                    arc.signal_completion_with_error(e.to_string());
                                 }
                             }
                         }
@@ -519,10 +521,12 @@ impl<'a> QueryStream<'a> {
         };
 
         if let Some(ref params) = config.parameters {
-            query_request.query_parameters = params
-                .iter()
-                .map(|(name, value)| build_query_parameter(name, value))
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut built = Vec::with_capacity(params.len());
+            for (name, source) in params {
+                let value = resolve_parameter_value(source, resource_loader, event_value).await?;
+                built.push(build_query_parameter(name, &value)?);
+            }
+            query_request.query_parameters = built;
         }
 
         if let Some(timeout) = config.timeout {
@@ -1020,6 +1024,28 @@ fn parse_time_to_micros(time_str: &str) -> Result<i64, Error> {
 }
 
 /// Build a query parameter from name and JSON value.
+/// Resolves a parameter to its value, loading and parsing the file when the
+/// parameter names a resource. A resource that does not parse as JSON is
+/// passed through as a string, so a plain text file still works.
+async fn resolve_parameter_value(
+    source: &super::config::QueryParameterSource,
+    resource_loader: Option<&flowgen_core::resource::ResourceLoader>,
+    event_value: &JsonValue,
+) -> Result<JsonValue, Error> {
+    match source {
+        super::config::QueryParameterSource::Literal(value) => Ok(value.clone()),
+        super::config::QueryParameterSource::Resource(source) => {
+            let content = flowgen_core::resource::Source::Resource {
+                resource: source.resource.clone(),
+            }
+            .render(resource_loader, event_value)
+            .await
+            .map_err(|source| Error::ResourceLoad { source })?;
+            Ok(serde_json::from_str(&content).unwrap_or(JsonValue::String(content)))
+        }
+    }
+}
+
 fn build_query_parameter(name: &str, value: &JsonValue) -> Result<QueryParameter, Error> {
     use super::config::{
         PARAM_TYPE_BOOL, PARAM_TYPE_FLOAT64, PARAM_TYPE_INT64, PARAM_TYPE_JSON, PARAM_TYPE_STRING,
@@ -1110,6 +1136,49 @@ mod tests {
     };
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn parameter_from_resource_is_loaded_and_parsed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("account_schema.json"),
+            r#"{"fields":[{"name":"Id","type":"STRING"},{"name":"Amount","type":"NUMERIC"}]}"#,
+        )
+        .expect("write schema");
+        let loader = flowgen_core::resource::ResourceLoader::new(Some(dir.path().to_path_buf()));
+
+        let source = super::super::config::QueryParameterSource::Resource(
+            super::super::config::QueryParameterResource {
+                resource: "account_schema.json".to_string(),
+            },
+        );
+        let value = resolve_parameter_value(&source, Some(&loader), &json!({}))
+            .await
+            .expect("resource parameter resolves");
+
+        let fields = value
+            .get("fields")
+            .and_then(|f| f.as_array())
+            .expect("parsed as JSON, not passed through as a string");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].get("name").unwrap(), "Id");
+
+        let param = build_query_parameter("schema", &value).expect("builds parameter");
+        assert_eq!(
+            param.parameter_type.parameter_type,
+            super::super::config::PARAM_TYPE_JSON,
+            "bound as JSON so SQL can walk it with JSON_QUERY_ARRAY"
+        );
+    }
+
+    #[tokio::test]
+    async fn literal_parameter_is_passed_through_unchanged() {
+        let source = super::super::config::QueryParameterSource::Literal(json!("CUST-1"));
+        let value = resolve_parameter_value(&source, None, &json!({}))
+            .await
+            .expect("literal resolves without a loader");
+        assert_eq!(value, json!("CUST-1"));
+    }
 
     #[test]
     fn test_parse_date_to_days() {

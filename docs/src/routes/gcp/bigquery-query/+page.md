@@ -23,7 +23,7 @@ Runs SQL queries against Google BigQuery. Returns results as Arrow RecordBatch.
 | `project_id` | string | required | GCP project ID (data project). |
 | `job_project_id` | string | | GCP project ID for billing (if different). |
 | `query` | string/resource | required | SQL query. Supports templating and resource files. |
-| `parameters` | map | | Named query parameters. |
+| `parameters` | map | | Named query parameters. A value may be a literal or `{ resource: "file.json" }`, which loads the file and passes its parsed contents (see [Parameters from a resource file](#parameters-from-a-resource-file)). |
 | `location` | string | | BigQuery location (e.g., `US`, `EU`). |
 | `max_results` | int | | Max rows per page. |
 | `timeout` | duration | `10s` | Query timeout. |
@@ -34,6 +34,43 @@ Runs SQL queries against Google BigQuery. Returns results as Arrow RecordBatch.
 | `use_storage_read` | bool | false | Route the result through the BigQuery Storage Read API instead of paginated REST results. Recommended for large result sets (over one million rows or one hundred megabytes). Adds temporary-table overhead for smaller queries and is not compatible with data-definition or data-manipulation statements such as `INSERT` or `CREATE TABLE`. |
 | `depends_on` | list | | Upstream task names. |
 | `retry` | object | | [Retry configuration](/docs/flowgen/concepts/retry). |
+
+### Parameters from a resource file
+
+A parameter value written as `{ resource: "..." }` is loaded from the resource path and passed as its parsed contents. Arrays and objects arrive as BigQuery's `JSON` type, so SQL reads them with `JSON_QUERY_ARRAY` and `JSON_VALUE`.
+
+This lets a query work from a schema file the flow already keeps on disk, instead of restating the same column list inside the SQL:
+
+```yaml
+- gcp_bigquery_query:
+    name: add_missing_columns
+    credentials_path: /etc/gcp/credentials.json
+    project_id: my-project
+    query: { resource: gcp/queries/add_missing_columns.sql }
+    parameters:
+      table_name: "orders"
+      schema: { resource: schemas/orders_schema.json }
+```
+
+```sql
+FOR col IN (
+  SELECT name, type FROM UNNEST(JSON_QUERY_ARRAY(@schema, '$.fields')) AS f,
+  UNNEST([STRUCT(JSON_VALUE(f, '$.name') AS name, JSON_VALUE(f, '$.type') AS type)])
+  WHERE name NOT IN (
+    SELECT column_name FROM `my-project.sales.INFORMATION_SCHEMA.COLUMNS`
+    WHERE table_name = @table_name
+  )
+)
+DO
+  EXECUTE IMMEDIATE FORMAT(
+    "ALTER TABLE `my-project.sales.%s` ADD COLUMN `%s` %s",
+    @table_name, col.name, col.type);
+END FOR;
+```
+
+Reading `INFORMATION_SCHEMA.COLUMNS` first matters: BigQuery counts every `ALTER TABLE` against a limit of 1500 table metadata updates per table per day, including statements that change nothing because the column already exists. A setup flow with `allow_rerun: true` that issues one `ALTER … ADD COLUMN IF NOT EXISTS` per column on every start will exhaust that quota after enough restarts. Adding only the columns that are actually absent costs no quota on a run with nothing to do.
+
+A file that does not parse as JSON is passed through as a string.
 
 ## Output
 

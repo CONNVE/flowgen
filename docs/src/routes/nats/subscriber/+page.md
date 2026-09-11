@@ -28,10 +28,11 @@ Consumes messages from a NATS JetStream stream. Source task — typically first 
 | `subject` | string | required | Subject to subscribe to (supports wildcards). |
 | `durable_name` | string | | Durable consumer name for persistent subscriptions. |
 | `stream` | object | | Stream configuration (see below). |
-| `max_messages` | int | | Max messages per batch fetch. |
+| `max_messages_per_batch` | int | `200` | Max messages the continuous pull stream asks NATS for in each batch request. |
 | `max_ack_pending` | int | | Max unacknowledged messages. |
 | `max_deliver` | int | | Max delivery attempts before discarding. |
-| `delay` | duration | | Delay between fetch requests. |
+| `batch_expires` | duration | `30s` | How long each batch request waits on the server before returning empty. Prevents empty fetch loops. |
+| `delay` | duration | | Deprecated and ignored. Use `throttle` to rate-limit individual messages. |
 | `throttle` | duration | | Delay between individual messages. |
 | `ack_timeout` | duration | wait indefinitely | Max time to wait for flow completion before letting JetStream redeliver. Also applied to the JetStream context timeout and the consumer `ack_wait`. |
 | `backoff` | list | | Redelivery backoff schedule (list of durations). |
@@ -50,6 +51,7 @@ Consumes messages from a NATS JetStream stream. Source task — typically first 
 | `max_bytes` | int | | Max stream size in bytes. |
 | `retention` | string | `limits` | Retention policy: `limits`, `interest`, `work_queue`. |
 | `discard` | string | `old` | Discard policy: `old`, `new`. |
+| `discard_new_per_subject` | bool | false | When `true`, rejects new messages if `max_messages_per_subject` limit is reached for that subject. Requires `discard: new`. |
 | `duplicate_window` | duration | | Deduplication window. |
 
 ## Output

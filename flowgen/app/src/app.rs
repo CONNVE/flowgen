@@ -303,6 +303,55 @@ pub struct App {
     pub logs_store: Option<Arc<dyn flowgen_core::telemetry::query::LogsStore>>,
 }
 
+/// The system bucket, opened once at startup, plus the name it was opened
+/// under. Other buckets resolve through [`SystemBucket::open_sibling`] so a
+/// config naming this same bucket reuses the connection instead of opening a
+/// second one.
+struct SystemBucket {
+    cache: Option<Arc<dyn flowgen_core::cache::Cache>>,
+    name: Option<String>,
+}
+
+impl SystemBucket {
+    /// Opens the bucket named by `cache.system.db_name`. Yields an empty
+    /// handle when the cache is disabled, leaving callers on their own
+    /// buckets and the executor on a per-pod in-memory store.
+    async fn open(app_config: &AppConfig) -> Self {
+        let name = app_config.cache.as_ref().map(|c| c.system.db_name.clone());
+        let cache = match &name {
+            Some(db_name) => match App::init_cache(app_config, Some(db_name)).await {
+                Ok(cache) => {
+                    info!("Initialized system cache on bucket '{db_name}'.");
+                    Some(cache)
+                }
+                Err(e) => {
+                    warn!(error = %e, bucket = %db_name, "System cache unavailable");
+                    None
+                }
+            },
+            None => None,
+        };
+        Self { cache, name }
+    }
+
+    /// Returns the open system bucket when `db_name` names it, otherwise
+    /// opens `db_name` as its own bucket.
+    async fn open_sibling(
+        &self,
+        app_config: &AppConfig,
+        db_name: &str,
+    ) -> Result<Arc<dyn flowgen_core::cache::Cache>, Error> {
+        match self
+            .cache
+            .as_ref()
+            .filter(|_| self.name.as_deref() == Some(db_name))
+        {
+            Some(cache) => Ok(Arc::clone(cache)),
+            None => App::init_cache(app_config, Some(db_name)).await,
+        }
+    }
+}
+
 impl App {
     /// Builds the runtime cache from config (NATS if enabled and reachable,
     /// otherwise in-memory). Callable before tracing is up so `main` can
@@ -317,12 +366,7 @@ impl App {
         if !cache_config.enabled {
             return Ok(Arc::new(flowgen_core::cache::memory::MemoryCache::new()));
         }
-        let db_name = db_name.unwrap_or_else(|| {
-            cache_config
-                .db_name
-                .as_deref()
-                .unwrap_or(crate::config::DEFAULT_CACHE_DB_NAME)
-        });
+        let db_name = db_name.unwrap_or(cache_config.runtime.db_name.as_str());
         let mut cache_builder =
             flowgen_nats::cache::CacheBuilder::new().url(cache_config.url.clone());
         if let Some(path) = cache_config.credentials_path.clone() {
@@ -629,26 +673,33 @@ impl App {
         let filesystem_flows = Self::load_flows_from_filesystem(&app_config)?;
         info!("Loaded {} flows from filesystem.", filesystem_flows.len());
 
-        let (cache_flows, system_cache) = match app_config.flows.cache.as_ref() {
-            Some(cache_opts) if cache_opts.enabled => {
-                match Self::init_cache(&app_config, Some(&cache_opts.db_name)).await {
-                    Ok(cache) => {
-                        info!(
-                            "Initialized system cache for flow loading on bucket '{}'.",
-                            cache_opts.db_name
-                        );
-                        let configs =
-                            Self::load_flows_from_cache(cache.as_ref(), &cache_opts.prefix).await?;
-                        info!("Loaded {} flows from cache.", configs.len());
-                        (configs, Some((cache, cache_opts.clone())))
-                    }
+        // The system bucket backs leader-election leases and peer
+        // registration, so it must exist whenever the cache does —
+        // independently of whether flows happen to load from the cache too.
+        let system = SystemBucket::open(&app_config).await;
+
+        // Resolved once and reused by the hot-reload watcher further down, so
+        // cache-backed flows cost one connection rather than one per consumer.
+        let flow_cache = match app_config.flows.cache.as_ref() {
+            Some(opts) if opts.enabled => {
+                match system.open_sibling(&app_config, &opts.db_name).await {
+                    Ok(cache) => Some((cache, opts)),
                     Err(e) => {
                         warn!(error = %e, "Flows will load from filesystem only");
-                        (Vec::new(), None)
+                        None
                     }
                 }
             }
-            _ => (Vec::new(), None),
+            _ => None,
+        };
+
+        let cache_flows = match &flow_cache {
+            Some((cache, opts)) => {
+                let configs = Self::load_flows_from_cache(cache.as_ref(), &opts.prefix).await?;
+                info!("Loaded {} flows from cache.", configs.len());
+                configs
+            }
+            None => Vec::new(),
         };
 
         let mut flow_configs = filesystem_flows;
@@ -681,7 +732,7 @@ impl App {
                     key = %cache_key,
                     "Cache flow shadowed by a filesystem flow with the same identity, deleting stale cache entry"
                 );
-                if let Some((ref cache, _)) = system_cache {
+                if let Some((cache, _)) = &flow_cache {
                     if let Err(e) = cache.delete(&cache_key).await {
                         warn!(
                             key = %cache_key,
@@ -853,31 +904,13 @@ impl App {
 
                 let cache_source = match resource_options.cache.as_ref() {
                     Some(rc) if rc.enabled => {
-                        // Reuse the system cache initialised for flow loading
-                        // when the bucket matches; otherwise spin up a fresh one.
-                        let cache = if system_cache.as_ref().map(|(_, opts)| opts.db_name.as_str())
-                            == Some(&rc.db_name)
-                        {
-                            system_cache.as_ref().map(|(c, _)| c.clone())
-                        } else {
-                            match Self::init_cache(&app_config, Some(&rc.db_name)).await {
-                                Ok(cache) => {
-                                    info!(
-                                        "Initialized system cache for resource loading on bucket '{}'.",
-                                        rc.db_name
-                                    );
-                                    Some(cache)
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        error = %e,
-                                        "Resources will load from filesystem only"
-                                    );
-                                    None
-                                }
+                        match system.open_sibling(&app_config, &rc.db_name).await {
+                            Ok(cache) => Some((cache, rc.prefix.clone())),
+                            Err(e) => {
+                                warn!(error = %e, "Resources will load from filesystem only");
+                                None
                             }
-                        };
-                        cache.map(|c| (c, rc.prefix.clone()))
+                        }
                     }
                     _ => None,
                 };
@@ -904,17 +937,25 @@ impl App {
         // identical credentials (e.g. same Salesforce org) reuse the same client.
         let client_registry = Arc::new(flowgen_core::client_registry::ClientRegistry::new());
 
-        // Resolve the system cache used for leader-election leases. When a
-        // dedicated system bucket is configured (the production NATS path)
-        // it lives in its own `Arc` separate from the runtime `cache`,
-        // keeping lease keys out of user-script reach and letting the two
-        // buckets carry different retention policies. Otherwise (in-memory
-        // single-binary, or NATS without a system bucket) we reuse the
-        // runtime cache so the executor still has somewhere to write.
-        let executor_cache: Arc<dyn flowgen_core::cache::Cache> = system_cache
-            .as_ref()
-            .map(|(c, _)| Arc::clone(c))
-            .unwrap_or_else(|| Arc::clone(&cache));
+        // Leases and peer keys go to the system bucket, out of reach of
+        // `ctx.cache`. It is absent only when the cache is disabled, which
+        // leaves the executor writing to a per-pod in-memory store.
+        let executor_cache: Arc<dyn flowgen_core::cache::Cache> = match &system.cache {
+            Some(cache) => Arc::clone(cache),
+            None => {
+                if flow_configs
+                    .iter()
+                    .any(|f| f.flow.require_leader_election.unwrap_or(false))
+                {
+                    warn!(
+                        "Leader election is configured but the cache is disabled, so leases \
+                         are held in memory per pod. Every pod will elect itself and run \
+                         these flows concurrently. Enable `cache` to coordinate across pods."
+                    );
+                }
+                Arc::clone(&cache)
+            }
+        };
 
         // Resolved once and shared via FlowBuilder so every flow's Executor
         // and this pod's PeerRegistry agree on who "this pod" is.
@@ -1219,7 +1260,7 @@ impl App {
                     logs_store: self.logs_store.clone(),
                     app_config: Arc::clone(&app_config),
                     conversation_cache: Arc::clone(&executor_cache),
-                    system_bucket_present: system_cache.is_some(),
+                    system_bucket_present: system.cache.is_some(),
                     conversation_history_ttl: web_config.agents.conversation_history_ttl,
                     login_client,
                     cookie_key,
@@ -1259,7 +1300,8 @@ impl App {
         // The watcher subscribes to flow key changes and the reconciler applies them.
         let watcher_shutdown = tokio_util::sync::CancellationToken::new();
         let runtime_cache = Arc::clone(&cache);
-        if let Some((system_cache_arc, cache_opts)) = &system_cache {
+        // Only cache-backed flows have keys to watch.
+        if let Some((system_cache_arc, cache_opts)) = &flow_cache {
             let prefix = cache_opts.prefix.clone();
             let (watch_tx, watch_rx) =
                 tokio::sync::mpsc::channel::<flowgen_core::cache::WatchEvent>(256);
@@ -1274,6 +1316,7 @@ impl App {
 
             let reconciler_ctx = crate::reconciler::ReconcilerContext {
                 cache: Arc::clone(system_cache_arc) as Arc<dyn flowgen_core::cache::Cache>,
+                system_cache: Arc::clone(&executor_cache),
                 runtime_cache: Arc::clone(&runtime_cache),
                 app_config: Arc::clone(&app_config),
                 resource_loader: resource_loader.clone(),

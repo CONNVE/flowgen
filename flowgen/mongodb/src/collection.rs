@@ -92,18 +92,24 @@ pub struct EventHandler {
 impl EventHandler {
     #[tracing::instrument(skip(self, event), name = "task.handle", fields(duration_ms = tracing::field::Empty))]
     async fn handle(&self, event: Event) -> Result<(), Error> {
-        match self.config.operation {
-            Operation::Read => self.read(event).await,
-            Operation::Write => self.write(event).await,
-        }
+        let event = Arc::new(event);
+        let completion_tx_arc = Arc::clone(&event).completion_tx.clone();
+
+        flowgen_core::event::with_event_context(&Arc::clone(&event), async move {
+            match self.config.operation {
+                Operation::Read => self.read(&completion_tx_arc).await,
+                Operation::Write => self.write(&event, &completion_tx_arc).await,
+            }
+        })
+        .await
     }
 
     /// Queries the configured collection with `filter` and emits each
     /// matching document as an event.
-    async fn read(&self, event: Event) -> Result<(), Error> {
-        let event = Arc::new(event);
-        let completion_tx_arc = Arc::clone(&event).completion_tx.clone();
-
+    async fn read(
+        &self,
+        completion_tx_arc: &Option<flowgen_core::event::SharedCompletionTx>,
+    ) -> Result<(), Error> {
         let collection: Collection<BsonDocument> = self
             .client
             .database(&self.config.db_name)
@@ -185,10 +191,11 @@ impl EventHandler {
     }
 
     /// Inserts the incoming event's JSON payload as a document.
-    async fn write(&self, event: Event) -> Result<(), Error> {
-        let event = Arc::new(event);
-        let completion_tx_arc = Arc::clone(&event).completion_tx.clone();
-
+    async fn write(
+        &self,
+        event: &Arc<Event>,
+        completion_tx_arc: &Option<flowgen_core::event::SharedCompletionTx>,
+    ) -> Result<(), Error> {
         let json = match &event.data {
             EventData::Json(value) => value.clone(),
             _ => return Err(Error::UnsupportedEventData),
@@ -367,6 +374,8 @@ impl flowgen_core::task::runner::Runner for Processor {
                                 error_event.error = Some(err.to_string());
                                 if let Some(ref tx) = event_handler.tx {
                                     tx.send(error_event).await.ok();
+                                } else if let Some(arc) = event.completion_tx.as_ref() {
+                                    arc.signal_completion_with_error(err.to_string());
                                 }
                             }
                         }

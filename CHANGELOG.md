@@ -1,5 +1,230 @@
 # Changelog
 
+## 0.135.0
+
+### Breaking
+
+- **`cache.db_name` is replaced by `cache.runtime.db_name`, and leases now
+  live in their own bucket.** The cache config declares two buckets on one
+  connection: `runtime` (flow state, reachable from scripts via `ctx.cache`)
+  and `system` (leader-election leases and peer registration, deliberately
+  out of reach). Both are optional and default to `flowgen_cache` /
+  `flowgen_system`.
+
+  ```yaml
+  cache:
+    enabled: true
+    url: nats.example.svc.cluster.local:4222
+    type: nats
+    runtime:
+      db_name: flowgen_cache
+    system:
+      db_name: flowgen_system
+  ```
+
+  Rename `cache.db_name` to `cache.runtime.db_name` if you set it. The old
+  key is no longer read, and a config that still carries it is rejected at
+  startup with the replacement spelled out — serde ignores unknown keys, so
+  accepting it silently would have moved the deployment onto the default
+  bucket and left the existing data behind. The system bucket is now created whenever the cache
+  is enabled — previously it only appeared as a side effect of loading flows
+  from the cache, so deployments serving flows from disk kept their leases
+  and peer keys in the runtime bucket, where any flow's script could read or
+  overwrite them. Those deployments move to the system bucket on restart:
+  the stale runtime leases expire after roughly a minute and flows resume,
+  so expect a brief pause on first start rather than a manual migration.
+
+  Leader election with the cache disabled now warns at startup — leases are
+  per-pod in memory there, so every pod elects itself and runs the same
+  flows concurrently.
+- **`object_store` tasks now take TLS root certificates from the host's
+  system trust store.** The `object_store` upgrade to 0.14 removed the
+  `tls-webpki-roots` feature flowgen was building with, so S3, GCS, and
+  Azure connections validate against the host's CA bundle instead of a
+  copy of the webpki roots compiled into the binary. The published
+  flowgen image is unaffected — its `distroless/cc-debian12` base ships
+  a CA bundle. If you run the binary somewhere that doesn't have one (a
+  `scratch` image, a stripped-down host), install `ca-certificates`
+  before upgrading or `object_store` connections will fail certificate
+  verification.
+- **`nats_jetstream_subscriber.max_messages` is renamed to
+  `max_messages_per_batch`, and `delay` is deprecated.** The new name
+  matches the underlying NATS option. The subscriber now uses a
+  continuous pull stream instead of looping over `fetch()` calls; the
+  old `fetch()` loop returned immediately on an empty queue and could
+  spin at hundreds of requests per second. The stream keeps each batch
+  request open with a server-side expiry, so an idle consumer waits on
+  NATS instead of polling. The `delay` field no longer has any effect —
+  use `throttle` to rate-limit individual messages. Dropping `fetch()` also
+  removes the subscriber's `Error::ConsumerBatch` variant, which nothing
+  can return now that no code path fetches a batch; anything matching on it
+  by name needs that arm deleted.
+
+### Features
+
+- **HTTP credentials now support the OAuth 2.0 client credentials flow.**
+  A credentials file can carry an `oauth2_client_credentials` block
+  (`token_url`, `client_id`, `client_secret`, optional `scope`) instead
+  of a static `bearer_auth` token. Flowgen fetches an access token from
+  the token endpoint, caches it, and refreshes it before it expires, so
+  APIs that only issue short-lived tokens no longer need a restart to
+  pick up a new one. Used by `http_request` and by the `mcp_servers`
+  entries on `ai_completion`; when present it takes precedence over
+  `bearer_auth` and `basic_auth`.
+- **`bigquery_storage_write` now warns about fields the table does not have.**
+  The encoder walks the table's schema, so a field in the data with no
+  matching column was dropped without a trace — a column added to the
+  pipeline but not to the table simply stopped arriving. The task now logs
+  the field names once per event. Event metadata belongs in `event.meta`, so
+  anything in `event.data` is expected to match the table.
+- **`gcp_bigquery_query` parameters can now be loaded from a resource file.**
+  A parameter written as `{ resource: "schema.json" }` is read from the
+  resource path and bound as its parsed contents — arrays and objects arrive
+  as BigQuery's `JSON` type, so SQL walks them with `JSON_QUERY_ARRAY`. This
+  lets a query work from a schema file the flow already keeps on disk instead
+  of restating the same column list inside the SQL. See
+  `examples/gcp/bigquery_query_schema_parameter.yaml`, which adds only the
+  columns a table is missing by diffing against `INFORMATION_SCHEMA` —
+  relevant because BigQuery counts every `ALTER TABLE` against a limit of
+  1500 table metadata updates per table per day, including ones that change
+  nothing. Only a lone `resource` key marks a file reference: an inline
+  object that happens to carry a `resource` field alongside others is still
+  bound as data, rather than having its remaining fields dropped.
+- **`salesforce_restapi_composite` can auto-populate each record's
+  `attributes`.** The Composite API requires every record to carry
+  `attributes: { type: "..." }`. Setting the task's `sobject_type` now
+  fills that in for any record that doesn't already have one, so
+  single-type batches no longer need the boilerplate on every record.
+  Records that already specify `attributes` are left untouched, so
+  mixed-type batches keep working. Without `sobject_type`, a record
+  missing `attributes` now fails with an error naming the record's
+  index instead of a generic API rejection.
+- **NATS JetStream publisher can now set a custom `Nats-Msg-Id` for
+  server-side deduplication.** The new `msg_id` field accepts a
+  templated string (e.g. `{{event.data.id}}`), overriding the previous
+  hardcoded fallback to `event.id`. Combined with a stream's
+  `duplicate_window`, republishing the same logical record no longer
+  stores a second copy — the server acks it as a duplicate instead of
+  erroring.
+- **JetStream streams can now hard-reject duplicate messages on a
+  subject.** The new `discard_new_per_subject` option, used together
+  with `discard: new` and `max_messages_per_subject`, makes the server
+  refuse a second publish to a subject that's already at its cap,
+  rather than silently evicting the first message to make room.
+
+### Fixes
+
+- **A failing BigQuery, MSSQL, or MongoDB task exposed over MCP returned
+  an empty success instead of the error.** These tasks reported a
+  retry-exhausted failure by sending an error event downstream, which
+  works mid-flow but does nothing when the task is the flow's last one —
+  there is no downstream to send to. The waiting `mcp_tool` source saw a
+  closed channel rather than a failure, so MCP clients (Claude Code,
+  opencode) got a result with no error set and no indication anything had
+  gone wrong. `bigquery_query`, `bigquery_job`, `bigquery_storage_read`,
+  `bigquery_storage_write`, `mssql_query`, and `mongodb_collection` now
+  signal the error back to the source, matching what the other 21 tasks
+  already did.
+- **`bigquery_storage_write`'s `trace_id` field was accepted in config
+  but never sent anywhere.** It's now passed through to the BigQuery
+  Storage Write API's `AppendRowsRequest`, so request tracing actually
+  works as documented.
+- **Tasks tracking their position could skip data when a pod shut down
+  mid-batch.** `git_sync`, `oci_sync`, `generate`, and the Salesforce
+  Pub/Sub subscriber persist a cursor (last commit, manifest digest,
+  timestamp, replay ID) after a batch completes. On shutdown that write
+  could still land even though the batch had been cut short, so the next
+  start resumed past events that were never emitted. All four now skip
+  the cursor write once cancellation is signalled, re-emitting on the
+  next start rather than silently dropping.
+- **`mongodb_collection` dropped upstream event metadata.** The task
+  emitted its events outside the event-context scope, so `meta` set by
+  earlier tasks in the flow never reached anything downstream of a
+  Mongo read or write.
+- **`oci_sync` binary layers discarded upstream metadata.** Layers that
+  aren't valid UTF-8 attach their own path and digest metadata, which
+  replaced the incoming event's `meta` wholesale instead of merging into
+  it.
+- **Salesforce Pub/Sub tasks opened one gRPC connection each.** Every
+  subscriber and publisher built its own channel to the Pub/Sub endpoint,
+  so a worker running several of them against one org held that many TLS
+  connections open, each with its own HTTP/2 keepalive ticking whether or
+  not events were flowing. Tasks sharing an endpoint now share one channel
+  through the client registry and multiplex over it — a subscriber and
+  publisher on the same org included. A reconnect evicts the channel
+  alongside the client, so a dropped connection is still rebuilt rather
+  than reused.
+- **`salesforce_pubsubapi_publisher` never recovered from a dropped
+  connection.** It built its gRPC channel once at startup and had no way to
+  replace it: a connection lost to anything other than an auth error (a
+  reset, a server-side restart) left the task publishing into a dead
+  transport, failing every event until the pod was restarted. It now
+  rebuilds the connection before the next event whenever a publish
+  exhausts its retries, the way the subscriber already reconnects on an
+  event-loop failure.
+- **`salesforce_pubsubapi_publisher` ignored its `endpoint` setting.** The
+  field was accepted in config but the publisher always connected to the
+  default Pub/Sub host, so pointing one at a regional endpoint (e.g. the
+  EU instance) silently did nothing. It now honours `endpoint` the way the
+  subscriber already did.
+- **A standby pod could stop being able to take over a flow.** The retry
+  loop waiting for a held lease used an uncapped exponential backoff that
+  was never reset, so a pod that had been waiting doubled its interval
+  indefinitely — after a day it re-checked roughly once every 36 hours, and
+  a leader dying at that point went unnoticed for just as long. Waiting for
+  a healthy holder is now a flat poll at the renewal interval; backoff
+  still applies to genuine errors, and resets once the lease is merely
+  held by someone else.
+- **Leader election cost more idle CPU than it needed to.** Renewing a
+  lease read it back first, purely to carry its generation counter forward,
+  making every renewal two round-trips to the cache. The holder already
+  knows the generation from when it acquired the lease, so it now passes it
+  through and renewal is a single write. On a worker with several
+  leader-elected flows this halves the steady background traffic, which on
+  an otherwise idle pod is most of what it was doing. The revision check
+  that guards against split-brain is unchanged.
+- **A lease deleted out from under its holder now reports as such.** The
+  renewal path returned a bare `NotFound` error instead of the
+  `LeaseDeleted` result it already had a variant for, because the removed
+  read hit the missing key first. Renewal now surfaces `LeaseDeleted` and
+  the flow re-arms acquisition.
+- **The peer registry logged a "Registered peer" line on every renewal.**
+  The renewal timer fired immediately on start rather than after the
+  interval, and each tick re-logged at INFO. Renewals now log at DEBUG
+  and the first one waits a full interval.
+- **`nats_jetstream_subscriber` no longer spins on an empty queue.**
+  Switching from a `fetch()` loop to a continuous pull stream with a
+  server-side batch expiry (default `30s`) eliminates the empty
+  request/reply storm that consumed CPU and NATS round-trips when no
+  messages were available.
+
+- **The Helm chart's liveness probe restarted healthy pods under load.** It
+  ran with Kubernetes' default `timeoutSeconds` of 1, so a worker busy
+  enough to delay the health handler by a second was killed after 45s —
+  losing in-flight work and shifting its load onto replicas that then timed
+  out in turn. Liveness now allows 5s per check and 75s of unresponsiveness
+  before restarting, and a new `startupProbe` covers slow starts so neither
+  of the other probes needs an `initialDelaySeconds`. Readiness stays
+  sensitive, since removing a pod from the load balancer is reversible and
+  a restart is not. All three are configurable under
+  `flowgen.health.probes.{startup,readiness,liveness}`.
+
+### Technical improvements
+
+- Integration test coverage for the OAuth 2.0 token flow (fetch, cache,
+  refresh, error paths, and concurrent callers collapsing into a single
+  token request) and for a DAG fan-out where two branches re-join the
+  same parent, one implicitly and one through `depends_on`.
+- The NATS JetStream integration tests now share publisher-spawn and
+  stream-inspection helpers, and each test starts its own container so
+  streams can't collide between tests.
+- Integration coverage for the subscriber's idle behaviour: one test reads
+  the NATS server's own `in_msgs` counter to assert an idle consumer is
+  waiting on a parked pull request rather than polling, and a second checks
+  that a message published after the consumer went idle still arrives on
+  that already-open request. The first fails against the old `fetch()` loop,
+  so the regression that motivated the switch stays covered.
+
 ## 0.134.0
 
 ### Features

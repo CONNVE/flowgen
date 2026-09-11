@@ -2136,4 +2136,86 @@ mod tests {
             _ => panic!("Expected JSON output."),
         }
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_put_runs_exactly_once_per_handle_call_with_array_event_data() {
+        let (tx, mut rx) = mpsc::channel(100);
+        let task_context = create_mock_task_context();
+        let cache = Arc::clone(&task_context.cache);
+
+        let processor = Processor {
+            config: Arc::new(crate::task::script::config::Processor {
+                name: "test_cache_put_once".to_string(),
+                engine: crate::task::script::config::ScriptEngine::Rhai,
+                code: crate::resource::Source::Inline(
+                    r#"
+                    ctx.cache.put("calls", "1", 300);
+                    ctx.meta.payload = event.data;
+                    event
+                    "#
+                    .to_string(),
+                ),
+                sandbox: None,
+                limits: crate::task::script::config::RhaiLimits::default(),
+                depends_on: None,
+                retry: None,
+            }),
+            tx: Some(tx),
+            rx: mpsc::channel(100).1,
+            task_id: 1,
+            task_context,
+            task_type: "test",
+        };
+
+        let event_handler = match processor.init().await {
+            Ok(handler) => handler,
+            Err(e) => panic!("processor.init() returned Err: {e:?}"),
+        };
+
+        let input_event = Event {
+            data: EventData::Json(json!([{"tick": 2}])),
+            subject: "test.subject".to_string(),
+            task_id: 0,
+            id: None,
+            timestamp: 123456789,
+            task_type: "test",
+            meta: None,
+            error: None,
+            completion_tx: None,
+        };
+
+        match event_handler.handle(input_event).await {
+            Ok(()) => {}
+            Err(e) => panic!("handle() returned Err: {e:?}"),
+        }
+
+        match rx.try_recv() {
+            Ok(event) => {
+                assert_eq!(event.task_id, 1);
+                assert_eq!(
+                    event.meta,
+                    Some({
+                        let mut m = Map::new();
+                        m.insert("payload".to_string(), json!([{"tick": 2}]));
+                        m
+                    }),
+                    "ctx.meta.payload = event.data must persist onto the output \
+                     event's meta field; got {:?}",
+                    event.meta
+                );
+            }
+            Err(e) => panic!("expected one output event on the channel, got: {e:?}"),
+        }
+
+        let keys = match cache.list_keys("").await {
+            Ok(keys) => keys,
+            Err(e) => panic!("cache.list_keys() returned Err: {e:?}"),
+        };
+        let call_key_count = keys.iter().filter(|k| k.ends_with("calls")).count();
+        assert_eq!(
+            call_key_count, 1,
+            "a single handle() call with array event.data wrote {call_key_count} \
+             cache keys ending in 'calls'; full key list: {keys:?}"
+        );
+    }
 }

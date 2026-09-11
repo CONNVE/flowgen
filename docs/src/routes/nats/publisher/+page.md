@@ -20,6 +20,7 @@ Publishes events to a NATS JetStream subject.
 | `credentials_path` | string | optional | Path to NATS credentials file. |
 | `url` | string | `localhost:4222` | NATS server URL. |
 | `subject` | string | required | Subject to publish to. Supports templating. |
+| `msg_id` | string | | NATS message ID for server-side deduplication. Can be a static string or templated from event data (e.g. `"{{event.data.record_id}}"`, `"fixed-key"`). Overrides `event.id` as the `Nats-Msg-Id` header. Requires `duplicate_window` on the stream to take effect. |
 | `stream` | object | | Optional stream configuration (same as subscriber). |
 | `depends_on` | list | | Upstream task names. |
 | `retry` | object | | [Retry configuration](/docs/flowgen/concepts/retry). |

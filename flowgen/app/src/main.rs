@@ -116,6 +116,11 @@ async fn main() {
         }
     };
 
+    if let Err(e) = app_config.validate() {
+        eprintln!("{e}");
+        process::exit(1);
+    }
+
     let cache = match App::init_cache(&app_config, None).await {
         Ok(c) => c,
         Err(e) => {

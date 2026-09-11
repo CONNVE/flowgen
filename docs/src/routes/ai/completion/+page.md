@@ -132,12 +132,25 @@ The agent connects to MCP servers, discovers tools, and can call them during com
       - url: "http://external-tools:8080/mcp"
 ```
 
-Optional per-server auth uses the same credentials JSON format as `http_request` (`bearer_auth` or `basic_auth`):
+Optional per-server auth uses the same credentials JSON format as `http_request` (`bearer_auth`, `basic_auth`, or `oauth2_client_credentials`):
 
 ```yaml
     mcp_servers:
       - url: "https://tools.example.com/mcp"
         credentials_path: /etc/flowgen/credentials/mcp_tools.json
+```
+
+For MCP servers that require OAuth 2.0, use the `oauth2_client_credentials` format in the credentials file — flowgen fetches and refreshes the access token automatically:
+
+```json
+{
+  "oauth2_client_credentials": {
+    "token_url": "https://auth.example.com/oauth2/token",
+    "client_id": "my-client-id",
+    "client_secret": "my-client-secret",
+    "scope": "api"
+  }
+}
 ```
 
 Each entry also accepts `headers`, sent with every request to that MCP server. Use it to identify this agent to an `mcp_tool` scoped by its own `headers` field, so the agent only sees and can call the tools meant for it:

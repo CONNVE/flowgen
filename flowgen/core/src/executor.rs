@@ -123,12 +123,13 @@ impl LeaseConfig {
 /// Result of lease acquisition attempt.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LeaseResult {
-    /// This executor acquired the lease.
-    Acquired { revision: u64 },
+    /// This executor acquired the lease. `generation` is carried back so
+    /// renewals can preserve it without re-reading the lease.
+    Acquired { revision: u64, generation: u64 },
     /// Another executor holds the lease.
     HeldByOther { holder: String },
     /// Lease expired and was taken over.
-    TakenOver { revision: u64 },
+    TakenOver { revision: u64, generation: u64 },
 }
 
 /// Result of lease renewal attempt.
@@ -216,7 +217,10 @@ impl Executor {
                     revision = %revision,
                     "Acquired new lease"
                 );
-                return Ok(LeaseResult::Acquired { revision });
+                return Ok(LeaseResult::Acquired {
+                    revision,
+                    generation: metadata.generation,
+                });
             }
             Err(crate::cache::CacheError::AlreadyExists) => {
                 // Lease exists - check if we can take it over.
@@ -248,6 +252,7 @@ impl Executor {
                             .await?;
                         return Ok(LeaseResult::Acquired {
                             revision: new_revision,
+                            generation: metadata.generation,
                         });
                     } else {
                         // Race condition: create() saw a key (tombstone or value), but now
@@ -273,9 +278,15 @@ impl Executor {
                 holder = %self.config.holder_identity,
                 "Already own this lease, renewing"
             );
-            match self.renew_lease(lease_name, current_revision).await? {
+            match self
+                .renew_lease(lease_name, current_revision, current_metadata.generation)
+                .await?
+            {
                 RenewalResult::Renewed { revision } => {
-                    return Ok(LeaseResult::Acquired { revision })
+                    return Ok(LeaseResult::Acquired {
+                        revision,
+                        generation: current_metadata.generation,
+                    })
                 }
                 RenewalResult::LostOwnership { holder } => {
                     return Ok(LeaseResult::HeldByOther { holder })
@@ -335,6 +346,7 @@ impl Executor {
                     );
                     Ok(LeaseResult::TakenOver {
                         revision: new_revision,
+                        generation: takeover_metadata.generation,
                     })
                 }
                 Err(crate::cache::CacheError::RevisionMismatch { .. }) => {
@@ -378,12 +390,16 @@ impl Executor {
     /// The revision number ensures consistency - if another process has taken over the lease,
     /// the update will fail with a revision mismatch.
     ///
-    /// The generation counter is preserved during renewal to maintain lease lineage. This
-    /// distinguishes between regular renewals and lease takeovers after expiration.
+    /// `generation` is supplied by the caller rather than re-read here: the
+    /// holder learned it when it acquired the lease, and a renewal every few
+    /// seconds per flow makes the extra round-trip the dominant cost on an
+    /// otherwise idle worker. The revision check below still rejects a
+    /// renewal that races a takeover.
     pub async fn renew_lease(
         &self,
         lease_name: &str,
         current_revision: u64,
+        generation: u64,
     ) -> Result<RenewalResult, crate::cache::Error> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -393,24 +409,11 @@ impl Executor {
             })?
             .as_secs();
 
-        // Fetch current lease metadata to preserve the generation counter.
-        // This extra round-trip is necessary because our cache API replaces the entire
-        // value during updates. Without this, we would lose the generation counter
-        // which tracks lease lineage across takeovers.
-        let (current_value, _) = self
-            .cache
-            .get_with_revision(lease_name)
-            .await?
-            .ok_or(crate::cache::CacheError::NotFound)?;
-
-        let current_metadata: LeaseMetadata = serde_json::from_slice(&current_value)
-            .map_err(|e| crate::cache::CacheError::GetFailed(Box::new(e)))?;
-
         let metadata = LeaseMetadata {
             holder_identity: self.config.holder_identity.clone(),
             renewed_at: now,
             lease_duration_secs: self.config.lease_duration.as_secs(),
-            generation: current_metadata.generation,
+            generation,
         };
 
         let value = serde_json::to_vec(&metadata)
@@ -625,13 +628,18 @@ mod tests {
     async fn test_renew_lease_successfully() {
         let executor = create_executor("executor-1");
 
-        let LeaseResult::Acquired { revision } =
-            executor.acquire_lease("test-lease").await.unwrap()
+        let LeaseResult::Acquired {
+            revision,
+            generation,
+        } = executor.acquire_lease("test-lease").await.unwrap()
         else {
             panic!("Failed to acquire lease");
         };
 
-        let result = executor.renew_lease("test-lease", revision).await.unwrap();
+        let result = executor
+            .renew_lease("test-lease", revision, generation)
+            .await
+            .unwrap();
         assert!(matches!(result, RenewalResult::Renewed { .. }));
     }
 
@@ -659,8 +667,10 @@ mod tests {
         .unwrap();
 
         // Executor 1 acquires lease.
-        let LeaseResult::Acquired { revision } =
-            executor1.acquire_lease("test-lease").await.unwrap()
+        let LeaseResult::Acquired {
+            revision,
+            generation,
+        } = executor1.acquire_lease("test-lease").await.unwrap()
         else {
             panic!("Failed to acquire lease");
         };
@@ -672,7 +682,10 @@ mod tests {
         executor2.acquire_lease("test-lease").await.unwrap();
 
         // Executor 1 tries to renew with old revision.
-        let result = executor1.renew_lease("test-lease", revision).await.unwrap();
+        let result = executor1
+            .renew_lease("test-lease", revision, generation)
+            .await
+            .unwrap();
         assert!(matches!(result, RenewalResult::LostOwnership { .. }));
     }
 
@@ -698,8 +711,10 @@ mod tests {
         let executor = Executor::new(cache.clone(), config).unwrap();
 
         // Acquire lease.
-        let LeaseResult::Acquired { revision } =
-            executor.acquire_lease("test-lease").await.unwrap()
+        let LeaseResult::Acquired {
+            revision,
+            generation,
+        } = executor.acquire_lease("test-lease").await.unwrap()
         else {
             panic!("Failed to acquire lease");
         };
@@ -707,9 +722,10 @@ mod tests {
         // Delete the lease externally.
         cache.delete("test-lease").await.unwrap();
 
-        // Try to renew - since the lease is deleted when we fetch to get generation, we get NotFound.
-        let result = executor.renew_lease("test-lease", revision).await;
-        assert!(matches!(result, Err(crate::cache::CacheError::NotFound)));
+        let result = executor
+            .renew_lease("test-lease", revision, generation)
+            .await;
+        assert!(matches!(result, Ok(RenewalResult::LeaseDeleted)));
     }
 
     #[tokio::test]

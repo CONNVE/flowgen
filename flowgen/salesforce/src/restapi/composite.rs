@@ -65,6 +65,14 @@ pub enum Error {
     #[error("Expected array data for composite operation")]
     InvalidCompositeDataFormat,
     #[error(
+        "Record at index {index} is missing `attributes` — \
+         Salesforce Composite API requires each record to include \
+         `attributes: {{ type: \"...\" }}`. Set `sobject_type` in the \
+         task config to auto-populate it, or add `attributes` to \
+         each record in the payload."
+    )]
+    MissingAttributes { index: usize },
+    #[error(
         "Client registry type mismatch — same credentials used with incompatible client types"
     )]
     ClientRegistryMismatch,
@@ -163,7 +171,7 @@ impl EventHandler {
     ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, Error> {
         let payload = config.payload.as_ref().ok_or(Error::MissingPayload)?;
 
-        match payload {
+        let mut records = match payload {
             super::config::CompositePayload::FromEvent { from_event } if *from_event => {
                 if let serde_json::Value::Array(records) = event_data {
                     records
@@ -173,13 +181,44 @@ impl EventHandler {
                                 .cloned()
                                 .ok_or(Error::InvalidCompositeRecordFormat)
                         })
-                        .collect()
+                        .collect::<Result<Vec<_>, _>>()?
                 } else {
-                    Err(Error::InvalidCompositeDataFormat)
+                    return Err(Error::InvalidCompositeDataFormat);
                 }
             }
-            super::config::CompositePayload::Records(records) => Ok(records.clone()),
-            _ => Err(Error::MissingPayload),
+            super::config::CompositePayload::Records(records) => records.clone(),
+            _ => return Err(Error::MissingPayload),
+        };
+
+        Self::ensure_attributes(&mut records, config.sobject_type.as_deref())?;
+
+        Ok(records)
+    }
+
+    fn ensure_attributes(
+        records: &mut [serde_json::Map<String, serde_json::Value>],
+        sobject_type: Option<&str>,
+    ) -> Result<(), Error> {
+        match sobject_type {
+            Some(sobject_type) => {
+                for record in records {
+                    if !record.contains_key("attributes") {
+                        record.insert(
+                            "attributes".to_string(),
+                            serde_json::json!({ "type": sobject_type }),
+                        );
+                    }
+                }
+                Ok(())
+            }
+            None => {
+                for (index, record) in records.iter().enumerate() {
+                    if !record.contains_key("attributes") {
+                        return Err(Error::MissingAttributes { index });
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1012,5 +1051,110 @@ mod tests {
         }"#;
         let config: super::super::config::Composite = serde_json::from_str(json).unwrap();
         assert!(config.all_or_none.is_none());
+    }
+
+    #[test]
+    fn test_ensure_attributes_injects_when_sobject_type_set() {
+        let mut records = vec![
+            serde_json::json!({ "Name": "Acme" })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            serde_json::json!({ "Name": "Globex" })
+                .as_object()
+                .cloned()
+                .unwrap(),
+        ];
+        EventHandler::ensure_attributes(&mut records, Some("Account")).unwrap();
+        assert_eq!(
+            records[0].get("attributes").unwrap(),
+            &serde_json::json!({ "type": "Account" })
+        );
+        assert_eq!(
+            records[1].get("attributes").unwrap(),
+            &serde_json::json!({ "type": "Account" })
+        );
+    }
+
+    #[test]
+    fn test_ensure_attributes_preserves_existing() {
+        let mut records = vec![
+            serde_json::json!({ "attributes": { "type": "Contact" }, "Name": "Alice" })
+                .as_object()
+                .cloned()
+                .unwrap(),
+        ];
+        EventHandler::ensure_attributes(&mut records, Some("Account")).unwrap();
+        assert_eq!(
+            records[0].get("attributes").unwrap(),
+            &serde_json::json!({ "type": "Contact" })
+        );
+    }
+
+    #[test]
+    fn test_ensure_attributes_errors_without_sobject_type() {
+        let mut records = vec![serde_json::json!({ "Name": "Acme" })
+            .as_object()
+            .cloned()
+            .unwrap()];
+        let err = EventHandler::ensure_attributes(&mut records, None).unwrap_err();
+        assert!(matches!(err, Error::MissingAttributes { index: 0 }));
+    }
+
+    #[test]
+    fn test_ensure_attributes_passes_when_all_have_attributes() {
+        let mut records = vec![
+            serde_json::json!({ "attributes": { "type": "Account" }, "Name": "Acme" })
+                .as_object()
+                .cloned()
+                .unwrap(),
+        ];
+        EventHandler::ensure_attributes(&mut records, None).unwrap();
+    }
+
+    #[test]
+    fn test_ensure_attributes_empty_records() {
+        let mut records: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
+        EventHandler::ensure_attributes(&mut records, Some("Account")).unwrap();
+        EventHandler::ensure_attributes(&mut records, None).unwrap();
+    }
+
+    #[test]
+    fn test_ensure_attributes_mixed_batch_no_sobject_type_errors() {
+        let mut records = vec![
+            serde_json::json!({ "attributes": { "type": "Account" }, "Name": "Acme" })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            serde_json::json!({ "Name": "Globex" })
+                .as_object()
+                .cloned()
+                .unwrap(),
+        ];
+        let err = EventHandler::ensure_attributes(&mut records, None).unwrap_err();
+        assert!(matches!(err, Error::MissingAttributes { index: 1 }));
+    }
+
+    #[test]
+    fn test_ensure_attributes_mixed_batch_with_sobject_type_injects_missing() {
+        let mut records = vec![
+            serde_json::json!({ "attributes": { "type": "Contact" }, "Name": "Alice" })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            serde_json::json!({ "Name": "Globex" })
+                .as_object()
+                .cloned()
+                .unwrap(),
+        ];
+        EventHandler::ensure_attributes(&mut records, Some("Account")).unwrap();
+        assert_eq!(
+            records[0].get("attributes").unwrap(),
+            &serde_json::json!({ "type": "Contact" })
+        );
+        assert_eq!(
+            records[1].get("attributes").unwrap(),
+            &serde_json::json!({ "type": "Account" })
+        );
     }
 }

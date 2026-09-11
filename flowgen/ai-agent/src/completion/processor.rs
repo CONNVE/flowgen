@@ -79,6 +79,12 @@ pub enum Error {
         #[source]
         source: flowgen_core::credentials::Error,
     },
+    #[error("OAuth 2.0 token fetch failed for MCP server at {url}: {source}")]
+    McpOAuth2 {
+        url: String,
+        #[source]
+        source: flowgen_core::credentials::OAuth2Error,
+    },
     #[error("Failed to connect to MCP server at {url}: {reason}")]
     McpConnection { url: String, reason: String },
     #[error("Invalid Authorization header for MCP server at {url}: {source}")]
@@ -218,12 +224,101 @@ pub struct Credentials {
     pub region: Option<String>,
 }
 
+/// One live MCP server connection plus the credentials used to establish
+/// it. Kept together so a later refresh check can tell whether the
+/// `Authorization` header has changed since `service` was connected.
+struct McpServerConnection {
+    url: String,
+    /// `None` when the server has no `credentials_path` — never needs refresh.
+    creds: Option<flowgen_core::credentials::HttpCredentials>,
+    /// Static headers from config, merged with the auth header on (re)connect.
+    static_headers: std::collections::HashMap<http::HeaderName, http::HeaderValue>,
+    /// Header value active on `service` at connect time, for change detection.
+    active_header: Option<String>,
+    service: rmcp::service::RunningService<rmcp::service::RoleClient, McpClientHandler>,
+}
+
 /// Tool server handle plus the `RunningService` connections backing it. The
 /// services must stay alive as long as tools are used — dropping a service
 /// closes its connection.
+///
+/// `connections` is behind a `Mutex` (rather than stored as a plain `Vec` at
+/// init time) because OAuth 2.0 client-credentials tokens expire while these
+/// connections are held open for the processor's entire lifetime;
+/// [`McpTools::ensure_fresh`] reconnects any server whose token has rotated.
 struct McpTools {
     handle: ToolServerHandle,
-    _services: Vec<rmcp::service::RunningService<rmcp::service::RoleClient, McpClientHandler>>,
+    client_info: rmcp::model::ClientInfo,
+    connections: tokio::sync::Mutex<Vec<McpServerConnection>>,
+}
+
+impl McpTools {
+    /// Re-checks the `Authorization` header for every MCP server backed by
+    /// `oauth2_client_credentials` and reconnects any whose token has
+    /// rotated since the last (re)connect. Bearer/Basic/no-auth servers are
+    /// static and skipped.
+    ///
+    /// Reconnecting registers tools under the same names via the shared
+    /// `handle`, so callers with an existing `ToolServerHandle` clone see
+    /// the refreshed connection without rebuilding their `AgentClient`.
+    async fn ensure_fresh(&self) -> Result<(), Error> {
+        let mut connections = self.connections.lock().await;
+        for conn in connections.iter_mut() {
+            let Some(creds) = &conn.creds else {
+                continue;
+            };
+            let header_value =
+                creds
+                    .authorization_header_async()
+                    .await
+                    .map_err(|source| Error::McpOAuth2 {
+                        url: conn.url.clone(),
+                        source,
+                    })?;
+            if header_value == conn.active_header {
+                continue;
+            }
+
+            let handler = McpClientHandler::new(self.client_info.clone(), self.handle.clone());
+            let mut headers = conn.static_headers.clone();
+            if let Some(header_value) = &header_value {
+                let value = http::HeaderValue::from_str(header_value).map_err(|source| {
+                    Error::McpAuthHeader {
+                        url: conn.url.clone(),
+                        source,
+                    }
+                })?;
+                headers.insert(http::header::AUTHORIZATION, value);
+            }
+            let transport = build_mcp_transport(&conn.url, headers);
+            let service = handler
+                .connect(transport)
+                .await
+                .map_err(|e| Error::McpConnection {
+                    url: conn.url.clone(),
+                    reason: e.to_string(),
+                })?;
+
+            info!(url = %conn.url, "Reconnected MCP server with refreshed OAuth 2.0 token");
+            conn.service = service;
+            conn.active_header = header_value;
+        }
+        Ok(())
+    }
+}
+
+/// Builds the streamable-HTTP transport for an MCP server with the given
+/// headers (auth header merged with any static config headers).
+fn build_mcp_transport(
+    url: &str,
+    headers: std::collections::HashMap<http::HeaderName, http::HeaderValue>,
+) -> rmcp::transport::StreamableHttpClientTransport<reqwest::Client> {
+    let mut transport_config =
+        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url);
+    if !headers.is_empty() {
+        transport_config = transport_config.custom_headers(headers);
+    }
+    rmcp::transport::StreamableHttpClientTransport::from_config(transport_config)
 }
 
 /// Connects to the configured MCP servers and discovers their tools. `None`
@@ -239,15 +334,12 @@ async fn connect_mcp_tools(config: &super::config::Processor) -> Result<Option<M
         rmcp::model::Implementation::from_build_env(),
     );
 
-    let mut services = Vec::with_capacity(config.mcp_servers.len());
+    let mut connections = Vec::with_capacity(config.mcp_servers.len());
     for mcp_config in &config.mcp_servers {
         let handler = McpClientHandler::new(client_info.clone(), handle.clone());
-        let mut transport_config =
-            rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
-                mcp_config.url.as_str(),
-            );
 
-        let mut headers = std::collections::HashMap::new();
+        let mut oauth_creds = None;
+        let mut header_value = None;
 
         if let Some(ref creds_path) = mcp_config.credentials_path {
             let creds = flowgen_core::credentials::load_http_credentials(creds_path)
@@ -258,18 +350,25 @@ async fn connect_mcp_tools(config: &super::config::Processor) -> Result<Option<M
                 })?;
             // Route through custom_headers rather than auth_header: rmcp's
             // auth_header wraps its value in `Bearer <...>`, which would
-            // double-prefix Basic credentials.
-            if let Some(header_value) = creds.authorization_header() {
-                let value = http::HeaderValue::from_str(&header_value).map_err(|source| {
-                    Error::McpAuthHeader {
+            // double-prefix Basic credentials. Use the async variant so
+            // OAuth 2.0 client credentials tokens are fetched/refreshed
+            // transparently.
+            header_value =
+                creds
+                    .authorization_header_async()
+                    .await
+                    .map_err(|source| Error::McpOAuth2 {
                         url: mcp_config.url.clone(),
                         source,
-                    }
-                })?;
-                headers.insert(http::header::AUTHORIZATION, value);
+                    })?;
+            // Only OAuth 2.0 credentials need a later refresh check — static
+            // bearer/basic headers never change.
+            if creds.oauth2_client_credentials.is_some() {
+                oauth_creds = Some(creds);
             }
         }
 
+        let mut static_headers = std::collections::HashMap::new();
         for (name, value) in mcp_config.headers.iter().flatten() {
             let header_name = http::HeaderName::try_from(name.as_str()).map_err(|source| {
                 Error::McpHeaderName {
@@ -284,15 +383,20 @@ async fn connect_mcp_tools(config: &super::config::Processor) -> Result<Option<M
                     name: name.clone(),
                     source,
                 })?;
-            headers.insert(header_name, header_value);
+            static_headers.insert(header_name, header_value);
         }
 
-        if !headers.is_empty() {
-            transport_config = transport_config.custom_headers(headers);
+        let mut headers = static_headers.clone();
+        if let Some(header_value) = &header_value {
+            let value = http::HeaderValue::from_str(header_value).map_err(|source| {
+                Error::McpAuthHeader {
+                    url: mcp_config.url.clone(),
+                    source,
+                }
+            })?;
+            headers.insert(http::header::AUTHORIZATION, value);
         }
-
-        let transport =
-            rmcp::transport::StreamableHttpClientTransport::from_config(transport_config);
+        let transport = build_mcp_transport(&mcp_config.url, headers);
 
         let service = handler
             .connect(transport)
@@ -301,14 +405,22 @@ async fn connect_mcp_tools(config: &super::config::Processor) -> Result<Option<M
                 url: mcp_config.url.clone(),
                 reason: e.to_string(),
             })?;
-        services.push(service);
 
         info!(url = %mcp_config.url, "Connected to MCP server and discovered tools");
+
+        connections.push(McpServerConnection {
+            url: mcp_config.url.clone(),
+            creds: oauth_creds,
+            static_headers,
+            active_header: header_value,
+            service,
+        });
     }
 
     Ok(Some(McpTools {
         handle,
-        _services: services,
+        client_info,
+        connections: tokio::sync::Mutex::new(connections),
     }))
 }
 
@@ -454,23 +566,17 @@ impl EventHandler {
     /// Resolves the agent client for this event.
     ///
     /// Renders the config against the event so per-event templated fields
-    /// (`endpoint`, `model`, `credentials_path`) become concrete values.
-    ///
-    /// When the flow uses MCP tools, a **fresh** client is built for every
-    /// event, each with its own short-lived MCP connection (see
-    /// [`connect_mcp_tools`]) — the connection can't be cached/reused because
-    /// rmcp's long-lived transport dies between calls. Otherwise the client is
-    /// cached in the worker-wide registry keyed by
-    /// `(provider, model, endpoint, credentials_path)`, so high-throughput
-    /// tool-less flows pay the build/credential cost only once.
-    /// Resolves the agent client for this event.
-    ///
-    /// Renders the config against the event so per-event templated fields
     /// (`endpoint`, `model`, `credentials_path`) become concrete values, then
     /// looks the resulting `(provider, model, endpoint, credentials_path)` up
     /// in the worker-wide client registry. The first event for a given key
     /// pays the credential-load and client-build cost; subsequent events reuse
     /// the cached `AgentClient`.
+    ///
+    /// MCP connections are established once in [`connect_mcp_tools`] and held
+    /// for the processor's lifetime; before returning an MCP-backed client,
+    /// this refreshes any OAuth 2.0 connection whose token has rotated (see
+    /// [`McpTools::ensure_fresh`]), since rmcp bakes the `Authorization`
+    /// header into the transport at connect time.
     async fn resolve_client(&self, event: &Event) -> Result<Arc<crate::agent::AgentClient>, Error> {
         let event_value = serde_json::value::Value::try_from(event)
             .map_err(|source| Error::EventBuilder { source })?;
@@ -486,6 +592,9 @@ impl EventHandler {
             .field("credentials_path", &rendered.credentials_path)
             .build();
 
+        if let Some(mcp_tools) = &self.mcp_tools {
+            mcp_tools.ensure_fresh().await?;
+        }
         let tool_server_handle = self.mcp_tools.as_ref().map(|t| t.handle.clone());
         let task_context = Arc::clone(&self.task_context);
         let static_context = self.config.static_context.clone();

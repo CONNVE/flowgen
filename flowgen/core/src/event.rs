@@ -621,6 +621,21 @@ impl EventBuilder {
         self
     }
 
+    /// Merges extra metadata into the builder's existing meta. Existing
+    /// keys are overwritten only when `extra` provides the same key.
+    pub fn meta_merge(mut self, extra: Map<String, Value>) -> Self {
+        match self.meta.take() {
+            Some(mut existing) => {
+                for (k, v) in extra {
+                    existing.insert(k, v);
+                }
+                self.meta = Some(existing);
+            }
+            None => self.meta = Some(extra),
+        }
+        self
+    }
+
     pub fn completion_tx(mut self, completion_tx: SharedCompletionTx) -> Self {
         self.completion_tx = Some(completion_tx);
         self

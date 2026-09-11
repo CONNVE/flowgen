@@ -22,6 +22,12 @@
 	// case should send a stray 401 elsewhere on the page to /auth/login.
 	let user = $state<UserContext | null>(null);
 	let authEnabled = $state(false);
+	// Gates the whole chrome+content render until /auth/me has answered, so
+	// a logged-out visitor sees a blank screen instead of a flash of the
+	// full UI (nav, "Failed to load flows", etc.) before the redirect below
+	// fires. Set true once we know either way — logged in, logged out with
+	// auth enabled (redirect about to happen), or auth not configured.
+	let authChecked = $state(false);
 
 	// User's explicit preference; `system` tracks the OS `prefers-color-scheme`.
 	let themePref = $state<ThemePref>('system');
@@ -44,22 +50,35 @@
 	// 401s every `/api/*` call once the session cookie is missing/expired and
 	// unrefreshable. Patch `fetch` once, globally, so every existing and
 	// future `fetch(apiUrl(...))` call site picks up the redirect for free.
-	// Only armed after `/auth/me` confirms login is actually offered — a 401
-	// can otherwise come from an unrelated upstream (e.g. a bad AI-gateway
-	// provider key on /api/agents/chat), and redirecting to /auth/login when
-	// it 404s (auth not configured) would just strand the user on a 404.
+	// Installed synchronously (before any page's own onMount can fire a
+	// competing fetch) but gated on `authReady` so a 401 landing before
+	// `/auth/me` resolves waits rather than slipping through unredirected —
+	// otherwise pages whose onMount fires their own fetch in parallel with
+	// this one (e.g. +page.svelte's api/flows call) can win the race and
+	// surface a raw 401 instead of redirecting. Only redirects once
+	// `authEnabled` is confirmed true — a 401 can otherwise come from an
+	// unrelated upstream (e.g. a bad AI-gateway provider key on
+	// /api/agents/chat), and redirecting to /auth/login when it 404s (auth
+	// not configured) would just strand the user on a 404.
 	const authPrefix = `${apiUrl('auth')}/`;
-	function installAuthRedirect() {
+	let resolveAuthReady: () => void;
+	const authReady = new Promise<void>((resolve) => {
+		resolveAuthReady = resolve;
+	});
+	(() => {
 		const realFetch = window.fetch.bind(window);
 		window.fetch = async (...args: Parameters<typeof fetch>) => {
 			const response = await realFetch(...args);
 			const url = args[0] instanceof Request ? args[0].url : String(args[0]);
 			if (response.status === 401 && !url.startsWith(authPrefix)) {
-				window.location.href = apiUrl('auth/login');
+				await authReady;
+				if (authEnabled) {
+					window.location.href = apiUrl('auth/login');
+				}
 			}
 			return response;
 		};
-	}
+	})();
 
 	onMount(async () => {
 		const navState = localStorage.getItem('flowgen-nav-collapsed');
@@ -76,6 +95,25 @@
 			osDark = e.matches;
 		});
 
+		// Must resolve before any other /api/* fetch in this component (e.g.
+		// api/version below) — those go through the interceptor above, which
+		// awaits authReady, so resolving it later than this would deadlock
+		// the component against itself.
+		try {
+			const res = await fetch(apiUrl('auth/me'));
+			authEnabled = res.status !== 404;
+			if (res.ok) user = await res.json();
+		} catch {
+			// /auth/me unreachable — stay signed out, auth stays un-armed
+		} finally {
+			resolveAuthReady();
+			// Logged-out-with-auth-enabled is about to redirect via the next
+			// /api/* call any child makes — leave the screen blank rather
+			// than flipping authChecked and rendering a UI that's just going
+			// to be replaced by a full navigation a moment later.
+			if (!authEnabled || user) authChecked = true;
+		}
+
 		try {
 			const res = await fetch(apiUrl('api/version'));
 			if (res.ok) {
@@ -85,18 +123,6 @@
 		} catch {
 			// version is optional
 		}
-
-		try {
-			// Deliberately bypasses the interceptor below (not yet installed)
-			// — this call is how we decide whether to install it at all.
-			const res = await fetch(apiUrl('auth/me'));
-			authEnabled = res.status !== 404;
-			if (res.ok) user = await res.json();
-		} catch {
-			// /auth/me unreachable — stay signed out, auth stays un-armed
-		}
-
-		if (authEnabled) installAuthRedirect();
 	});
 
 	async function logout() {
@@ -113,6 +139,11 @@
 	}
 </script>
 
+{#if !authChecked}
+	<div class="flex min-h-screen items-center justify-center bg-base-100">
+		<span class="loading loading-spinner loading-lg text-primary"></span>
+	</div>
+{:else}
 <div class="min-h-screen overflow-x-hidden bg-base-100 text-base-content">
 	<div class="flex min-h-screen w-full min-w-0">
 		<aside
@@ -282,3 +313,4 @@
 		</div>
 	</div>
 </div>
+{/if}

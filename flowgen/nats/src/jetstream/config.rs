@@ -50,8 +50,30 @@ fn default_nats_url() -> String {
     crate::client::DEFAULT_NATS_URL.to_string()
 }
 
+/// Default number of messages the JetStream pull consumer asks for in each
+/// batch request. The continuous stream keeps a single batch in flight; when
+/// it is consumed or expires, the next batch is requested automatically.
+const DEFAULT_MAX_MESSAGES_PER_BATCH: usize = 200;
+
+/// Default batch request expiry for the JetStream pull consumer stream.
+///
+/// This is what prevents the subscriber from spinning: instead of returning
+/// immediately when no messages are available, the server holds the request
+/// open for this duration and either delivers messages or a timeout status.
+const DEFAULT_BATCH_EXPIRES: Duration = Duration::from_secs(30);
+
+/// Default value for [`Config::max_messages_per_batch`].
+fn default_max_messages_per_batch() -> usize {
+    DEFAULT_MAX_MESSAGES_PER_BATCH
+}
+
+/// Default value for [`Config::batch_expires`].
+fn default_batch_expires() -> Duration {
+    DEFAULT_BATCH_EXPIRES
+}
+
 /// Unified configuration for both NATS JetStream publisher and subscriber tasks.
-#[derive(PartialEq, Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
 pub struct Config {
     /// The unique name / identifier of the task.
     pub name: String,
@@ -70,8 +92,18 @@ pub struct Config {
     pub stream: Option<StreamOptions>,
     /// Durable consumer name (subscriber only).
     pub durable_name: Option<String>,
-    /// Maximum number of messages to fetch per batch (subscriber only).
-    pub max_messages: Option<usize>,
+    /// Maximum number of messages per batch request for the continuous pull
+    /// stream (subscriber only). Higher values improve throughput; lower
+    /// values reduce the number of messages buffered in memory and the time
+    /// before a shutdown cleanly finishes the current batch.
+    #[serde(default = "default_max_messages_per_batch")]
+    pub max_messages_per_batch: usize,
+    /// How long each batch request waits on the server before returning empty
+    /// (subscriber only). This prevents empty fetch loops by asking NATS to
+    /// hold the request open until messages arrive or the timeout elapses.
+    /// Accepts duration strings: "5s", "30s", "1m", etc.
+    #[serde(default = "default_batch_expires", with = "humantime_serde")]
+    pub batch_expires: Duration,
     /// Maximum number of unacknowledged messages allowed (subscriber only).
     /// Limits concurrent in-flight messages across all consumer instances.
     /// Set to 1 to prevent duplicate processing in multi-pod deployments.
@@ -83,6 +115,11 @@ pub struct Config {
     /// Default: None (uses NATS server default, typically 512).
     pub max_waiting: Option<i64>,
     /// Delay between message batch fetches (subscriber only).
+    ///
+    /// Deprecated: the subscriber now uses a continuous pull stream with a
+    /// server-side batch expiry, so there are no empty fetch loops to slow
+    /// down. Use `throttle` to rate-limit individual messages instead.
+    /// Kept for backward compatibility and ignored by the handler.
     /// Accepts duration strings: "100ms", "1s", "5m", etc.
     #[serde(default, with = "humantime_serde")]
     pub delay: Option<Duration>,
@@ -119,9 +156,41 @@ pub struct Config {
     /// When not set, the task receives from the previous task in the list (linear chain).
     #[serde(default)]
     pub depends_on: Option<Vec<String>>,
+    /// Optional NATS message ID for server-side deduplication.
+    /// Can be a static string or templated from event data (e.g.
+    /// `"{{event.data.record_id}}"`, `"fixed-key"`).
+    /// When set, overrides `event.id` as the `Nats-Msg-Id` header on publish.
+    /// Requires `duplicate_window` on the stream to take effect.
+    #[serde(default)]
+    pub msg_id: Option<String>,
     /// Optional retry configuration (overrides app-level retry config).
     #[serde(default)]
     pub retry: Option<flowgen_core::retry::RetryConfig>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            credentials_path: None,
+            url: default_nats_url(),
+            subject: String::new(),
+            stream: None,
+            durable_name: None,
+            max_messages_per_batch: default_max_messages_per_batch(),
+            max_ack_pending: None,
+            max_waiting: None,
+            batch_expires: default_batch_expires(),
+            delay: None,
+            throttle: None,
+            ack_timeout: None,
+            max_deliver: None,
+            backoff: Vec::new(),
+            depends_on: None,
+            msg_id: None,
+            retry: None,
+        }
+    }
 }
 
 /// Type alias for backward compatibility with publisher code.
@@ -163,6 +232,10 @@ pub struct StreamOptions {
     /// Discard policy for when stream limits are reached.
     /// If None during update, keeps the existing value.
     pub discard: Option<DiscardPolicy>,
+    /// When `true`, prevents a message from being added to the stream
+    /// if the `max_messages_per_subject` limit for the subject has been reached.
+    /// Requires `discard: New` to be set.
+    pub discard_new_per_subject: Option<bool>,
     /// Duplicate window (e.g., "120s", "2m", "1h").
     /// Prevents duplicate messages within this time window.
     #[serde(default, with = "humantime_serde")]
@@ -217,7 +290,11 @@ mod tests {
         assert_eq!(config.subject, String::new());
         assert_eq!(config.stream, None);
         assert_eq!(config.durable_name, None);
-        assert_eq!(config.max_messages, None);
+        assert_eq!(
+            config.max_messages_per_batch,
+            DEFAULT_MAX_MESSAGES_PER_BATCH
+        );
+        assert_eq!(config.batch_expires, DEFAULT_BATCH_EXPIRES);
         assert_eq!(config.delay, None);
     }
 
@@ -236,7 +313,7 @@ mod tests {
                 ..Default::default()
             }),
             durable_name: Some("test_consumer".to_string()),
-            max_messages: Some(100),
+            max_messages_per_batch: 100,
             delay: Some(Duration::from_secs(5)),
             ..Default::default()
         };
@@ -249,7 +326,7 @@ mod tests {
         assert_eq!(subscriber.subject, "test.subject");
         assert!(subscriber.stream.is_some());
         assert_eq!(subscriber.durable_name, Some("test_consumer".to_string()));
-        assert_eq!(subscriber.max_messages, Some(100));
+        assert_eq!(subscriber.max_messages_per_batch, 100);
         assert_eq!(subscriber.delay, Some(Duration::from_secs(5)));
     }
 
@@ -268,7 +345,7 @@ mod tests {
                 ..Default::default()
             }),
             durable_name: Some("my_durable".to_string()),
-            max_messages: Some(50),
+            max_messages_per_batch: 50,
             delay: Some(Duration::from_secs(10)),
             ..Default::default()
         };
@@ -293,7 +370,7 @@ mod tests {
                 ..Default::default()
             }),
             durable_name: Some("clone_consumer".to_string()),
-            max_messages: Some(25),
+            max_messages_per_batch: 25,
             delay: None,
             ..Default::default()
         };
@@ -310,7 +387,10 @@ mod tests {
         assert_eq!(publisher.subject, String::new());
         assert_eq!(publisher.stream, None);
         assert_eq!(publisher.durable_name, None);
-        assert_eq!(publisher.max_messages, None);
+        assert_eq!(
+            publisher.max_messages_per_batch,
+            DEFAULT_MAX_MESSAGES_PER_BATCH
+        );
         assert_eq!(publisher.delay, None);
     }
 
@@ -334,7 +414,6 @@ mod tests {
             subject: "pub.subject.1".to_string(),
             stream: Some(stream_opts.clone()),
             durable_name: None,
-            max_messages: None,
             delay: None,
             ..Default::default()
         };
@@ -371,7 +450,6 @@ mod tests {
                 ..Default::default()
             }),
             durable_name: None,
-            max_messages: None,
             delay: None,
             ..Default::default()
         };
@@ -398,7 +476,6 @@ mod tests {
                 ..Default::default()
             }),
             durable_name: None,
-            max_messages: None,
             delay: None,
             ..Default::default()
         };
@@ -415,7 +492,6 @@ mod tests {
             subject: "simple.subject".to_string(),
             stream: None,
             durable_name: None,
-            max_messages: None,
             delay: None,
             ..Default::default()
         };
@@ -446,7 +522,6 @@ mod tests {
             subject: "subject.1".to_string(),
             stream: Some(stream_opts),
             durable_name: None,
-            max_messages: None,
             delay: None,
             ..Default::default()
         };
@@ -473,7 +548,7 @@ mod tests {
                 ..Default::default()
             }),
             durable_name: Some("consumer1".to_string()),
-            max_messages: Some(10),
+            max_messages_per_batch: 10,
             delay: Some(Duration::from_secs(1)),
             ..Default::default()
         };
@@ -491,7 +566,7 @@ mod tests {
                 ..Default::default()
             }),
             durable_name: Some("consumer1".to_string()),
-            max_messages: Some(10),
+            max_messages_per_batch: 10,
             delay: Some(Duration::from_secs(1)),
             ..Default::default()
         };

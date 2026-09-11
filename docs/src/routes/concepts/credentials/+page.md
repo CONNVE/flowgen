@@ -6,7 +6,9 @@ Tasks that talk to external systems load credentials from a JSON file referenced
 
 | Task family | Format | What it authenticates |
 |---|---|---|
-| `http_endpoint`, `http_request`, `mcp_tool` | `HttpCredentials` (bearer / basic) | The HTTP request header. |
+| `http_request`, `ai_completion` (`mcp_servers`) | `HttpCredentials` (bearer / basic / OAuth 2.0 client credentials) | The outgoing HTTP request header. |
+| `http_endpoint` | `HttpCredentials` (bearer / basic) | Incoming requests, checked against the expected token. |
+| `mcp_tool` | `Credentials` (`api_keys` list) | Incoming MCP calls, checked against the allowed keys. |
 | `nats_jetstream_*`, `nats_kv_store` | NATS credentials JSON | NATS server connection. |
 | `gcp_*` (BigQuery) | GCP service account JSON | Google Cloud APIs. |
 | `salesforce_*` | Salesforce credentials JSON | Salesforce REST / Pub/Sub / Bulk APIs. |
@@ -28,7 +30,7 @@ If you need to inject secrets at deploy time without writing them to disk, use a
 
 ## HTTP credentials
 
-The most common shared format is `HttpCredentials`, used by `http_endpoint`, `http_request`, and similar tasks:
+The most common shared format is `HttpCredentials`, used by `http_request`, `http_endpoint`, and similar tasks:
 
 ```json
 {
@@ -48,6 +50,27 @@ Or basic auth:
 ```
 
 Both fields are optional. If neither is set, no `Authorization` header is added.
+
+### OAuth 2.0 client credentials
+
+For APIs that require short-lived access tokens (e.g. Salesforce Marketing Cloud hosted MCP), use the `oauth2_client_credentials` field instead of a static bearer token. Flowgen fetches a token from the token endpoint using the [client credentials grant type](https://datatracker.ietf.org/doc/html/rfc6749#section-4.4), caches it, and auto-refreshes when it expires:
+
+```json
+{
+  "oauth2_client_credentials": {
+    "token_url": "https://auth.example.com/oauth2/token",
+    "client_id": "my-client-id",
+    "client_secret": "my-client-secret",
+    "scope": "api"
+  }
+}
+```
+
+The `scope` field is optional. When `oauth2_client_credentials` is present, it takes precedence over `bearer_auth` and `basic_auth`.
+
+This applies to tasks that *send* authenticated requests — `http_request` and the `mcp_servers` entries on `ai_completion`. Tasks that *validate* incoming requests (`http_endpoint`) only read `bearer_auth` and `basic_auth`; an `oauth2_client_credentials` block there has no effect.
+
+If the token endpoint omits `expires_in`, flowgen assumes a 5-minute lifetime and refreshes accordingly.
 
 ## Example — webhook with bearer auth
 
@@ -112,6 +135,6 @@ Tasks with different identity fields get separate clients. Two MSSQL tasks with 
 ## Operational notes
 
 - **File permissions** should be `0600` (read-write for the flowgen user only). Flowgen does not enforce this — the operator is responsible.
-- **Hot reload** is not supported. Credentials are read once at task initialisation. To rotate, restart the worker (or use connector-specific token refresh, e.g., GCP service account auto-rotation).
+- **Hot reload** is not supported. Credentials are read once at task initialisation. To rotate, restart the worker. OAuth 2.0 access tokens are an exception — they auto-refresh transparently when they expire.
 - **Errors at startup**: if the file is missing or malformed, the task fails to initialise and the standard retry circuit breaker fires. After ~15 minutes the task gives up. Watch worker logs for `Failed to read credentials` or `Failed to parse credentials` messages.
 - **Never commit credential files to Git.** Pair with `git_sync` carefully: sync flow YAML, but mount credentials separately via a Kubernetes secret.

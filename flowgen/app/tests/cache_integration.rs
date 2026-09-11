@@ -19,7 +19,9 @@
 
 use bytes::Bytes;
 use flowgen::app::App;
-use flowgen::config::{AppConfig, CacheOptions, CacheType, FlowOptions};
+use flowgen::config::{
+    AppConfig, BucketOptions, CacheOptions, CacheType, FlowOptions, SystemBucketOptions,
+};
 use flowgen_core::cache::Cache;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +52,8 @@ fn app_config_with_cache(url: String) -> AppConfig {
             credentials_path: None,
             url,
             db_name: None,
+            runtime: BucketOptions::default(),
+            system: SystemBucketOptions::default(),
             history: Some(64),
             tombstone_ttl: Some(Duration::from_secs(3600)),
         }),
